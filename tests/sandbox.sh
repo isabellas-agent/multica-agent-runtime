@@ -20,6 +20,7 @@ echo own > "$root/workdir/marker"
 echo next-to-workdir > "$root/settings.json"
 echo secret-of-task2 > "$other/workdir/file"
 echo runner-only > "$HOME/runner-file"
+mkdir -p "$HOME/.pi/agent/extensions" && echo ext > "$HOME/.pi/agent/extensions/provider.ts"
 mkdir -p "$WS/.repos/ws1"
 git init -q --bare "$WS/.repos/ws1/r.git"
 git -C "$WS/.repos/ws1/r.git" -c user.email=t@t -c user.name=t commit-tree -m init \
@@ -52,6 +53,8 @@ grep -q persisted /data/agent-homes/agent1/.bashrc || fail "home write did not p
 grep -q persisted "$HOME/.bashrc" && fail "home write reached the runner home"
 S 'jq -e ".mcpServers | has(\"playwright\")" "$HOME/.claude/.claude.json" >/dev/null' \
   || fail "browser MCPs not registered in the per-agent home"
+S '[ "$(cat "$HOME/.pi/agent/extensions/provider.ts")" = ext ]' || fail "Pi extensions of the runner not visible"
+blocked 'echo x > "$HOME/.pi/agent/extensions/provider.ts"'
 S 'cd repo && git -c user.email=t@t -c user.name=t commit -q --allow-empty -m sandbox' || fail "worktree commit"
 (cd "$root/workdir" && env "${task_env[@]}" agent-sandbox bash -c 'cat /tmp/multica-mcp-test/mcp.json' \
   --mcp-config /tmp/multica-mcp-test/mcp.json) >/dev/null || fail "daemon temp file from the arguments not visible"
@@ -68,7 +71,8 @@ step "refusals and probes"
   && fail "bad agent id was not refused"
 probe=$(mktemp -d)
 (cd "$probe" && env -u MULTICA_TASK_ID MULTICA_TOKEN=mul_daemon agent-sandbox bash -c \
-  '[ "$HOME" = /home/agent ] && [ ! -e /home/agent/runner-file ] && [ -z "${MULTICA_TOKEN:-}" ]') \
+  '[ "$HOME" = /home/agent ] && [ ! -e /home/agent/runner-file ] && [ -z "${MULTICA_TOKEN:-}" ] \
+  && [ -f /home/agent/.pi/agent/extensions/provider.ts ]') \
   || fail "probe mode"
 for c in claude codex pi omp; do
   (cd "$probe" && "/usr/local/lib/multica-agent-runtime/sandbox-bin/$c" --version) || fail "$c --version through the shim"

@@ -206,7 +206,7 @@ if [ -n "${CODEX_HOME:-}" ] && [ -d "$CODEX_HOME" ]; then
   done < <(find "$CODEX_HOME" -maxdepth 2 -type l -print0 2>/dev/null)
 fi
 
-# Pi / omp: provider config from the runner home (ro), login rw (refresh), into this HOME
+# Pi / omp: provider config and extensions from the runner home (ro), login rw (refresh), into this HOME
 for d in .pi/agent .omp/agent; do
   for f in models.json models.yml auth.json; do
     src=$RUNNER_HOME/$d/$f
@@ -218,6 +218,13 @@ for d in .pi/agent .omp/agent; do
     fi
     bind "$mode" "$src" "$home/$d/$f"
   done
+  # extensions of the runner (e.g. a provider that discovers the gateway's models), ro; they replace
+  # the per-agent home's own extensions dir
+  src=$RUNNER_HOME/$d/extensions
+  if [ -d "$src" ]; then
+    [ "$task_mode" = 1 ] && mkdir -p "$home/$d/extensions"
+    bind ro "$src" "$home/$d/extensions"
+  fi
 done
 
 # a CLI installed into the runner home at runtime (npm prefix ~/.local)

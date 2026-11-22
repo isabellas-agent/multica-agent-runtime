@@ -130,7 +130,7 @@ changes are needed.
 | the task's own directory, `$TMPDIR`, the repo cache of its Multica workspace | rw, same paths |
 | `HOME=/data/agent-homes/<agent id>` | per agent, persistent (session resume, caches), seeded like the runner home |
 | `/home/agent/.claude` | the per-agent `.claude`; this task's `projects/<cwd>` transcripts are the runner's (the daemon checks them for resume) |
-| logins of this CLI: Claude `.credentials.json`, Codex `auth.json`, Pi/omp `auth.json` | rw (token refresh), `models.*` ro |
+| logins of this CLI: Claude `.credentials.json`, Codex `auth.json`, Pi/omp `auth.json` | rw (token refresh), `models.*` and `extensions/` ro |
 | `/usr`, `/etc`, `/opt`, `/var` ro, `/nix` rw, Docker socket, GPU device nodes | shared |
 | own `/tmp`, `/dev/shm`, `/run`, PID/IPC/UTS namespaces | private |
 
