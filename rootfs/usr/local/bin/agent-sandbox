@@ -156,8 +156,11 @@ if [ "$claude_dir" = "$RUNNER_HOME/.claude" ]; then
     mkdir -p "$claude_dir/projects/$slug"
     args+=(--bind "$claude_dir/projects/$slug" "$claude_dir/projects/$slug")
   fi
-  # file login (refreshed by Claude itself, so rw), unless a token is passed through the env
-  if [ "$cli" = claude ] && [ -s "$claude_dir/.credentials.json" ] && [ -z "${pass[CLAUDE_CODE_OAUTH_TOKEN]:-}" ]; then
+  # file login (refreshed by Claude itself, so rw), unless a token is actually passed through the env
+  # (listing CLAUDE_CODE_OAUTH_TOKEN in AGENT_SANDBOX_PASS_ENV is not enough: it may be unset or set
+  # only in some agents' custom env)
+  if [ "$cli" = claude ] && [ -s "$claude_dir/.credentials.json" ] &&
+    { [ -z "${pass[CLAUDE_CODE_OAUTH_TOKEN]:-}" ] || [ -z "${CLAUDE_CODE_OAUTH_TOKEN:-}" ]; }; then
     args+=(--bind "$claude_dir/.credentials.json" "$claude_dir/.credentials.json")
   fi
 elif [ -d "$claude_dir" ]; then
