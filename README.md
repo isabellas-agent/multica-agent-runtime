@@ -147,6 +147,10 @@ the pod. Bind mounts of the work dir, `$HOME` and `$TMPDIR` work, `/tmp` inside 
 private (`docker run -v /tmp/x` mounts the pod's `/tmp`). `AGENT_SANDBOX_DOCKER=0` (agent custom env)
 takes the socket away from that agent.
 
+With the sandbox on, the entrypoint sets `MULTICA_WARM_POOL=off` (unless set): the daemon's warm
+session pool (Multica v0.12+) hands warm Claude/Codex processes their task token through a file in
+the daemon's `/tmp`, which the sandbox cannot see.
+
 `AGENT_SANDBOX=required` refuses to start the daemon when bwrap cannot create namespaces (the pod
 needs the same settings as rootless Docker); `on` then runs unsandboxed with a warning. `doctor`
 shows the state.
@@ -279,6 +283,7 @@ Nothing is baked in; the standard variables are read natively:
 | `AGENT_SANDBOX` | `off` | `on` / `required`: each task's CLI in bubblewrap, see [Task sandbox](#task-sandbox) |
 | `AGENT_SANDBOX_PASS_ENV` | – | secret-looking variables passed into the sandbox (comma separated) |
 | `AGENT_SANDBOX_DOCKER` | `1` | `0`: no Docker socket in the sandbox |
+| `MULTICA_WARM_POOL` | `off` with the sandbox | Multica's warm Claude/Codex session pool; does not work inside the sandbox |
 | `AGENT_SANDBOX_HOMES`, `AGENT_SANDBOX_ROOTS` | `/data/agent-homes`, `/data` | per-agent homes; allowed roots for task paths |
 | `BROWSER_MCP` | `1` | `0`: do not register the browser MCP servers for the agents |
 | `BROWSER_MCP_ARGS_PLAYWRIGHT`, `BROWSER_MCP_ARGS_DEVTOOLS` | see [Browser testing](#browser-testing) | arguments of newly registered browser MCP servers |

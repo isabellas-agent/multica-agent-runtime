@@ -43,6 +43,18 @@ setup_sandbox() {
     export "$var=$SANDBOX_SHIMS/$cli"
     active+=("$cli")
   done
+  # The daemon's warm session pool (Multica >= v0.12) keeps Claude/Codex running between turns and hands
+  # them MULTICA_TOKEN/MULTICA_TASK_ID through a file below the daemon's /tmp (MULTICA_TASK_ENV_FILE)
+  # instead of the environment: agent-sandbox then sees no task and the file is not inside the sandbox
+  # ("requires MULTICA_TOKEN to be a task-scoped mat_ token"). Upstream turns the pool off only for
+  # custom profile commands, not for MULTICA_<CLI>_PATH shims, so turn it off here.
+  if [ ${#active[@]} -gt 0 ]; then
+    case "${MULTICA_WARM_POOL:-}" in
+      "") export MULTICA_WARM_POOL=off ;;
+      0 | false | off | no) ;;
+      *) warn "sandbox: MULTICA_WARM_POOL=$MULTICA_WARM_POOL: warm Claude/Codex sessions get no task token in the sandbox" ;;
+    esac
+  fi
   mkdir -p "${AGENT_SANDBOX_HOMES:-/data/agent-homes}"
   # runtime-doctor in the shell container (masked /proc, no bwrap) reads this from agent.env
   agent_env AGENT_SANDBOX_PREFLIGHT ok
