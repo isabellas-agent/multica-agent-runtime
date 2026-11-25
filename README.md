@@ -1,7 +1,7 @@
 # multica-agent-runtime
 
 Container images that run the [Multica](https://github.com/multica-ai/multica) agent daemon with
-**Claude Code**, **Codex**, **Pi** and **Oh My Pi**, made for Kubernetes: Docker-in-Docker (rootless or
+**Claude Code**, **Codex**, **OpenCode 2**, **Pi** and **Oh My Pi**, made for Kubernetes: Docker-in-Docker (rootless or
 rootful), a CUDA variant with GPU access for nested containers, Chrome for Testing + Playwright for
 browser tests, Nix with configurable caches, `gh` and `tea`, and a web terminal for the CLI logins.
 
@@ -40,7 +40,7 @@ at build time (e.g. `libasound2` → `libasound2t64`). Images are rebuilt on eve
 | | |
 |---|---|
 | Multica | `multica` CLI/daemon (copied from the official backend image) |
-| Agents | Claude Code, Codex, Pi (npm), Oh My Pi (release binary); pinned, auto-update off |
+| Agents | Claude Code, Codex, OpenCode 2, Pi (all npm), Oh My Pi (release binary); pinned, auto-update off |
 | Browser | Chrome for Testing at `/opt/google/chrome/chrome`, `@playwright/test`, Playwright MCP, chrome-devtools-mcp, xvfb |
 | Containers | Docker engine (rootless extras, buildx, compose), slirp4netns, fuse-overlayfs; cuda: nvidia-container-toolkit, nvtop |
 | Git | git, git-lfs, gh, tea, openssh-client |
@@ -57,8 +57,13 @@ named `$MULTICA_AGENT_RUNTIME_NAME · <CLI>` (e.g. "multica-agent-gpu-01 · Clau
 an agent is bound to one runtime and model; issues assigned to it run with that CLI. Several runners
 (e.g. a cpu and a cuda one) can serve the same workspace: give each its own `MULTICA_DAEMON_ID`,
 runtime name and `/home/agent` volume (logins are per runner). Build with
-`--build-arg AGENTS="claude codex"` to leave one out. The daemon detects CLIs and their models at
-start: restart it after logging in to a CLI.
+`--build-arg AGENTS="claude codex"` to leave one out (choices: `claude`, `codex`, `opencode`, `pi`,
+`omp`). The daemon detects CLIs and their models at start: restart it after logging in to a CLI.
+
+OpenCode 2 is installed from `@opencode/cli`, which provides both `opencode` and `opencode2`. Multica
+detects `opencode` and registers it as the **OpenCode** runtime (the CLI's major version selects
+Multica's OpenCode 2 backend); `opencode2` is the v2 command for use in the web shell. Multica does not
+detect a separate `opencode2` runtime.
 
 ## Commands
 
@@ -101,6 +106,7 @@ Mount a volume at `/home/agent`: logins and CLI state live there and survive res
 |---|---|---|
 | Claude Code (subscription) | `claude` → `/login` in the web shell (shows a URL, paste the code back) | `CLAUDE_CODE_OAUTH_TOKEN` from `claude setup-token` (1 year), `ANTHROPIC_API_KEY`, `ANTHROPIC_BASE_URL` |
 | Codex | `codex login --device-auth` | `OPENAI_API_KEY` |
+| OpenCode 2 | `opencode2` → `/connect` in the web shell (provider + credentials) | provider API keys (e.g. `ANTHROPIC_API_KEY`, `OPENAI_API_KEY`) |
 | Pi | `pi` → `/login` in the web shell | provider API keys (e.g. `ANTHROPIC_API_KEY`, `OPENAI_API_KEY`) |
 | Oh My Pi | `omp` → `/login` in the web shell | provider API keys (e.g. `ANTHROPIC_API_KEY`, `OPENAI_API_KEY`) |
 | Multica | – | `MULTICA_TOKEN` (personal access token), re-applied on every start |
@@ -121,7 +127,7 @@ mount them at `/etc/agent-ssh` (copied to `~/.ssh` with mode 600).
 
 Without it, every task is a child of the daemon: same uid, same `HOME`, the daemon's whole
 environment (`GH_TOKEN`, API keys, …), the other tasks' directories and processes. With
-`AGENT_SANDBOX=on` the entrypoint points `MULTICA_{CLAUDE,CODEX,PI,OMP}_PATH` at shims that run each
+`AGENT_SANDBOX=on` the entrypoint points `MULTICA_{CLAUDE,CODEX,OPENCODE,PI,OMP}_PATH` at shims that run each
 task's CLI through [`agent-sandbox`](rootfs/usr/local/bin/agent-sandbox) in bubblewrap. No Multica
 changes are needed.
 
@@ -131,6 +137,7 @@ changes are needed.
 | `HOME=/data/agent-homes/<agent id>` | per agent, persistent (session resume, caches), seeded like the runner home |
 | `/home/agent/.claude` | the per-agent `.claude`; this task's `projects/<cwd>` transcripts are the runner's (the daemon checks them for resume) |
 | logins of this CLI: Claude `.credentials.json`, Codex `auth.json`, Pi/omp `auth.json` | rw (token refresh), `models.*` and `extensions/` ro |
+| OpenCode `opencode.db` | copied from the runner on first use into the per-agent home (credentials + sessions stay per agent) |
 | `/usr`, `/etc`, `/opt`, `/var` ro, `/nix` rw, Docker socket, GPU device nodes | shared |
 | own `/tmp`, `/dev/shm`, `/run`, PID/IPC/UTS namespaces | private |
 
@@ -231,10 +238,11 @@ Playwright MCP and chrome-devtools-mcp use it without configuration. The wrapper
 `--no-sandbox` when the user-namespace sandbox is unavailable and `--disable-dev-shm-usage` with a
 small `/dev/shm` (`CHROME_EXTRA_ARGS` for more). Give `/dev/shm` ≥ 1 GiB for heavy pages.
 
-Both MCP servers are registered for every installed agent on each start, as `playwright`
+Both MCP servers are registered for Claude Code, Codex, Pi and Oh My Pi on each start, as `playwright`
 (`playwright-mcp --browser chrome --headless --isolated`) and `chrome-devtools`
 (`chrome-devtools-mcp --headless --isolated`). `--isolated` gives each session a throwaway profile,
-so parallel tasks do not collide. Names that already exist are left alone, so own edits win.
+so parallel tasks do not collide. Names that already exist are left alone, so own edits win. OpenCode 2
+gets its MCP servers from Multica (over ACP), not from a local config file.
 
 | Agent | File |
 |---|---|

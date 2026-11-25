@@ -33,7 +33,7 @@ setup_sandbox() {
     agent_env AGENT_SANDBOX_ACTIVE none
     return 0
   fi
-  for cli in claude codex pi omp; do
+  for cli in claude codex opencode pi omp; do
     command -v "$cli" >/dev/null || continue
     var=MULTICA_${cli^^}_PATH
     if is_set "$var"; then

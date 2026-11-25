@@ -26,18 +26,21 @@ grep -q '# local edit' "$HOME/.vimrc" || fail "seed overwrote an existing file"
 
 step "versions"
 jq . /etc/multica-agent-runtime/versions.json
-for k in multica claude-code codex pi omp chrome playwright docker gh tea ttyd; do
+for k in multica claude-code codex opencode pi omp chrome playwright docker gh tea ttyd; do
   [ -n "$(jq -r --arg k "$k" '.[$k] // empty' /etc/multica-agent-runtime/versions.json)" ] || fail "no version for $k"
 done
 
 step "CLIs"
-for c in multica claude codex pi omp gh tea git git-lfs vim tmux ttyd node npm pnpm uv uvx python3 \
+for c in multica claude codex opencode opencode2 pi omp gh tea git git-lfs vim tmux ttyd node npm pnpm uv uvx python3 \
   jq yq rg fd docker playwright playwright-mcp chrome-devtools-mcp bwrap socat nix; do
   command -v "$c" >/dev/null || fail "$c not on PATH"
 done
 multica version
 claude --version
 codex --version
+opencode --version
+# @opencode/cli installs both names; Multica detects `opencode`, `opencode2` is the v2 alias
+opencode2 --version >/dev/null || fail "opencode2 not runnable"
 pi --version
 omp --version
 gh --version | head -n1

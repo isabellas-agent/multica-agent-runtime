@@ -13,6 +13,7 @@ declare -A v=(
   [multica]="$(first_line multica version)"
   [claude-code]="$(first_line claude --version)"
   [codex]="$(first_line codex --version)"
+  [opencode]="$(first_line opencode --version)"
   [pi]="$(first_line pi --version)"
   [omp]="$(first_line omp --version)"
   [node]="$(first_line node --version)"

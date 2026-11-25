@@ -74,7 +74,7 @@ probe=$(mktemp -d)
   '[ "$HOME" = /home/agent ] && [ ! -e /home/agent/runner-file ] && [ -z "${MULTICA_TOKEN:-}" ] \
   && [ -f /home/agent/.pi/agent/extensions/provider.ts ]') \
   || fail "probe mode"
-for c in claude codex pi omp; do
+for c in claude codex opencode pi omp; do
   (cd "$probe" && "/usr/local/lib/multica-agent-runtime/sandbox-bin/$c" --version) || fail "$c --version through the shim"
 done
 

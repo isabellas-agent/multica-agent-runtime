@@ -1,7 +1,7 @@
 # syntax=docker/dockerfile:1@sha256:572cebbc2b15e6f84c077742952674889cb63cd5e9b80abdffcbe587b6f19183
 # hadolint global ignore=DL3008,DL3016,DL4006,SC2016
 #
-# Multica agent runtime: the Multica daemon with Claude Code, Codex, Pi and Oh My Pi,
+# Multica agent runtime: the Multica daemon with Claude Code, Codex, OpenCode 2, Pi and Oh My Pi,
 # Docker-in-Docker, Nix, Chrome for Testing + Playwright, gh and tea. VARIANT picks the base:
 #   cpu   Ubuntu 26.04
 #   cuda  nvidia/cuda runtime (same Ubuntu) + nvidia-container-toolkit for GPU containers inside
@@ -179,6 +179,10 @@ RUN npm install --global --prefix /usr/local --no-fund --no-audit \
 ARG CLAUDE_CODE_VERSION=2.1.332
 # renovate: datasource=npm depName=@openai/codex
 ARG CODEX_VERSION=0.172.0
+# OpenCode 2: the @opencode/cli package installs both `opencode` (the command Multica detects) and
+# `opencode2`. Multica v0.12+ selects its v2/ACP backend from the CLI's major version.
+# renovate: datasource=npm depName=@opencode/cli
+ARG OPENCODE_VERSION=2.4.1
 # renovate: datasource=npm depName=@earendil-works/pi-coding-agent
 ARG PI_VERSION=1.6.0
 # Oh My Pi: the npm package needs Bun, so the standalone release binary instead (~280 MB)
@@ -186,12 +190,13 @@ ARG PI_VERSION=1.6.0
 ARG OMP_VERSION=v19.1.1
 ARG OMP_SHA256=04e9490f9394da6d6804474cc2e41eb3d18f8e26215df4b34bdd4ad4c0d8a401
 # AGENTS: which CLIs to install (the Multica daemon registers one runtime per CLI it finds)
-ARG AGENTS="claude codex pi omp"
+ARG AGENTS="claude codex opencode pi omp"
 RUN pkgs=(); \
   for a in $AGENTS; do \
     case "$a" in \
       claude) pkgs+=("@anthropic-ai/claude-code@${CLAUDE_CODE_VERSION}") ;; \
       codex) pkgs+=("@openai/codex@${CODEX_VERSION}") ;; \
+      opencode) pkgs+=("@opencode/cli@${OPENCODE_VERSION}") ;; \
       pi) pkgs+=("@earendil-works/pi-coding-agent@${PI_VERSION}") ;; \
       omp) \
         curl -fsSL -o /tmp/omp "https://github.com/can1357/oh-my-pi/releases/download/${OMP_VERSION}/omp-linux-x64"; \
@@ -254,7 +259,7 @@ RUN set -eux; \
   test -r /etc/nix/nix.conf; \
   nix config show experimental-features | grep -q flakes; \
   nix eval --expr '1 + 1'; \
-  multica version; claude --version || true; command -v codex pi omp claude || true; \
+  multica version; claude --version || true; command -v codex opencode opencode2 pi omp claude || true; \
   rm -rf "$HOME"
 
 EXPOSE 7681
@@ -262,5 +267,5 @@ ENTRYPOINT ["/usr/bin/tini", "-g", "--", "/usr/local/bin/entrypoint.sh"]
 CMD ["daemon"]
 
 LABEL org.opencontainers.image.title="multica-agent-runtime" \
-      org.opencontainers.image.description="Multica agent daemon with Claude Code, Codex, Pi, Oh My Pi, Docker-in-Docker, Nix and Chrome" \
+      org.opencontainers.image.description="Multica agent daemon with Claude Code, Codex, OpenCode 2, Pi, Oh My Pi, Docker-in-Docker, Nix and Chrome" \
       org.opencontainers.image.licenses="MIT"

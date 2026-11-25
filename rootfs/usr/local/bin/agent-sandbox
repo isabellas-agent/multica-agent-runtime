@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 # agent-sandbox <cli> [args...]: runs an agent CLI for one Multica task inside bubblewrap.
 #
-# The entrypoint points MULTICA_{CLAUDE,CODEX,PI,OMP}_PATH at the shims in
+# The entrypoint points MULTICA_{CLAUDE,CODEX,OPENCODE,PI,OMP}_PATH at the shims in
 # /usr/local/lib/multica-agent-runtime/sandbox-bin (AGENT_SANDBOX=on|required); they exec this script.
 # The daemon starts it in the task's work directory with the task's environment, stdin/stdout carry
 # the agent protocol and pass through unchanged. See README.md, "Task sandbox".
@@ -138,6 +138,18 @@ if [ "$task_mode" = 1 ]; then
     mkdir -p "$home/.claude" "$home/.config" "$home/.cache" "$home/.local/bin"
     # browser MCPs in the user config of every CLI, as the entrypoint does for the runner home
     HOME=$home CLAUDE_CONFIG_DIR=$home/.claude CODEX_HOME=$home/.codex register_browser_mcps
+    # OpenCode 2 keeps credentials *and sessions* in ~/.local/share/opencode/opencode.db. Seed a copy
+    # from the runner on first use so /connect logins work and sessions stay per agent. A rw bind of
+    # that SQLite file would share sessions and race with other tasks (and miss its -wal/-shm files).
+    # With OPENCODE_DB or a custom XDG_DATA_HOME, pass a provider key via AGENT_SANDBOX_PASS_ENV.
+    if [ "$cli" = opencode ] && [ -z "${XDG_DATA_HOME:-}" ] && [ -z "${OPENCODE_DB:-}" ]; then
+      oc_src=$RUNNER_HOME/.local/share/opencode
+      mkdir -p "$home/.local/share/opencode"
+      for f in "$oc_src"/opencode.db* "$oc_src"/auth.json; do
+        [ -e "$f" ] || continue
+        [ -e "$home/.local/share/opencode/$(basename "$f")" ] || cp -f "$f" "$home/.local/share/opencode/"
+      done
+    fi
   ) 9>"$home.lock" >/dev/null 2>&1 || warn "per-agent home setup incomplete ($home)"
   bind rw "$home"
 fi
@@ -207,6 +219,15 @@ if [ -n "${CODEX_HOME:-}" ] && [ -d "$CODEX_HOME" ]; then
       *) bind ro "$t" ;;
     esac
   done < <(find "$CODEX_HOME" -maxdepth 2 -type l -print0 2>/dev/null)
+fi
+
+# OpenCode version/model probes (no task) need the runner's logins for model discovery. They are
+# short-lived and never write, so bind the DB at its default path into the throwaway home.
+if [ "$cli" = opencode ] && [ "$task_mode" = 0 ] && [ -z "${XDG_DATA_HOME:-}" ] && [ -z "${OPENCODE_DB:-}" ]; then
+  oc_dir=$RUNNER_HOME/.local/share/opencode
+  for oc_file in "$oc_dir"/opencode.db* "$oc_dir"/auth.json; do
+    [ -e "$oc_file" ] && bind rw "$oc_file"
+  done
 fi
 
 # Pi / omp: provider config and extensions from the runner home (ro), login rw (refresh), into this HOME
