@@ -73,6 +73,8 @@ spec:
       labels: {app: multica-runner}
     spec:
       hostUsers: false
+      # the webui sees the daemon's tasks (processes, task locks); without it only mtimes are left
+      shareProcessNamespace: true
       automountServiceAccountToken: false
       enableServiceLinks: false
       terminationGracePeriodSeconds: 60
@@ -140,7 +142,7 @@ spec:
             requests: {cpu: 10m, memory: 64Mi}
             limits: {cpu: "2", memory: 2Gi}
           volumeMounts: *mounts
-        # workspace cleanup UI: lists /data/workspaces, deletes the workspaces that are not in use
+        # management UI: agent tasks, resources, workspace cleanup, browser terminals
         # (built from this fork; the published images do not have the webui command yet)
         - name: webui
           image: <your registry>/multica-agent-runtime:webui
@@ -152,14 +154,15 @@ spec:
             - {name: WEBUI_AUTH, valueFrom: {secretKeyRef: {name: multica-webui, key: auth}}}
             - {name: MULTICA_DAEMON_PORT, value: "19514"}   # daemon status, same pod
             - {name: MULTICA_WORKSPACES_ROOT, value: /data/workspaces}
-            - {name: WEBUI_PROTECT_WORKSPACES, value: homelab}   # never delete the active workspace
+          envFrom:
+            - secretRef: {name: multica-runner}   # tokens for the terminal's shells
           securityContext:
             runAsUser: 1000
             runAsGroup: 1000
             allowPrivilegeEscalation: false
           resources:
             requests: {cpu: 10m, memory: 64Mi}
-            limits: {cpu: "1", memory: 512Mi}
+            limits: {cpu: "2", memory: 2Gi}   # the terminal runs real work
           volumeMounts: *mounts
       volumes:
         - {name: home, persistentVolumeClaim: {claimName: multica-runner-home}}
@@ -173,11 +176,15 @@ Expose the shell (port 7681, WebSocket) only behind an authenticating reverse pr
 gateway, oauth2-proxy, ...; see [Web shell](../README.md#web-shell)): ttyd has no login and the shell
 gives access to every token in the pod and to Docker. Restrict it with a NetworkPolicy to the gateway.
 
-The workspace cleanup UI (`webui`, port 8090) has its own login (`WEBUI_AUTH`), but it deletes data:
-expose it through the same proxy and NetworkPolicy, or only via `kubectl port-forward`. Without
-`WEBUI_AUTH` it refuses to listen on `0.0.0.0`. Its activity detection sees the tasks of this pod (same
-PID namespace); with the UI in another pod the 300 s `WEBUI_ACTIVITY_GRACE` is the only guard, so keep
-that value comfortable. See [Workspace cleanup web UI](../README.md#workspace-cleanup-web-ui).
+The management UI (`webui`, port 8090) has its own login (`WEBUI_AUTH`), but it deletes data and opens
+shells: expose it through the same proxy and NetworkPolicy, or only via `kubectl port-forward`. Without
+`WEBUI_AUTH` it refuses to listen on `0.0.0.0`. Containers of a pod have separate PID namespaces unless
+`shareProcessNamespace: true` is set: without it the UI cannot see the daemon's processes and task
+locks, shows a warning, and treats everything changed within `WEBUI_BLIND_GRACE` (6 h) as in use while
+the daemon runs tasks. `shareProcessNamespace` also makes the processes of every container visible to
+the others (and `/proc/<pid>/environ` of same-uid processes readable) — all containers here run the
+same agent user with the same secret, so that changes little. See
+[Management web UI](../README.md#management-web-ui).
 
 Several runners (e.g. one `cpu`, one `cuda` with the GPU): one Deployment each, with its own
 `MULTICA_DAEMON_ID` / `MULTICA_DAEMON_DEVICE_NAME` / `MULTICA_AGENT_RUNTIME_NAME`, its own PVCs and its

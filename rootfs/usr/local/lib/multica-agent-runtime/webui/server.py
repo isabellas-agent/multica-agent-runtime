@@ -1,15 +1,19 @@
 #!/usr/bin/env python3
 # shellcheck shell=python
-"""Management web UI of multica-agent-runtime: workspace data that is not in use can be deleted.
+"""Management web UI of multica-agent-runtime: agent status, resources, workspace cleanup, shell.
 
 Serves one page (static/) and a small JSON API:
 
-    GET  /api/workspaces          workspaces, sizes, activity, in-use state
-    POST /api/workspaces/delete   {"items":[{"dir":..., "confirm":...}], "dry_run":bool}
+    GET  /api/agents              daemon status, running agent tasks, Docker containers
+    GET  /api/system              CPU / memory / network history, filesystems, GPUs, top processes
+    GET  /api/workspaces          workspaces and their task directories: size, activity, in-use state
+    POST /api/workspaces/delete   {"items":[{"dir":..., "task":..., "confirm":...}], "dry_run":bool}
+    GET  /api/terminal            WebSocket: browser terminal (?mode=shell|tmux&dir=..&task=..)
     GET  /api/health              liveness plus effective configuration
 
-Runs as an unprivileged agent user and needs nothing but Python's standard library. It never
-talks to the Multica server; the optional daemon status comes from the daemon's local socket.
+Runs as an unprivileged agent user and needs nothing but Python's standard library (the terminal
+page uses xterm.js from the image's node_modules). It never talks to the Multica server; the daemon
+status comes from the daemon's local /health endpoint.
 
     WEBUI_BIND=0.0.0.0 WEBUI_PORT=8090 WEBUI_AUTH=user:secret multica-webui
 """
@@ -26,24 +30,45 @@ import signal
 import sys
 import threading
 import time
+import urllib.parse
 from http import HTTPStatus
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from typing import Any
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 
+import system_stats  # noqa: E402
+import terminal  # noqa: E402
 import workspace_store as store  # noqa: E402
 
-VERSION = "1.0.0"
+VERSION = "2.0.0"
 STATIC_DIR = os.path.join(os.path.dirname(os.path.abspath(__file__)), "static")
 MAX_BODY = 64 * 1024
 STATIC_FILES = {
     "/": ("index.html", "text/html; charset=utf-8"),
     "/index.html": ("index.html", "text/html; charset=utf-8"),
     "/app.js": ("app.js", "text/javascript; charset=utf-8"),
+    "/overview.js": ("overview.js", "text/javascript; charset=utf-8"),
+    "/workspaces.js": ("workspaces.js", "text/javascript; charset=utf-8"),
+    "/terminal.js": ("terminal.js", "text/javascript; charset=utf-8"),
     "/style.css": ("style.css", "text/css; charset=utf-8"),
     "/favicon.svg": ("favicon.svg", "image/svg+xml"),
 }
+# xterm.js for the terminal, from node_modules (installed by the Dockerfile)
+VENDOR_FILES = {
+    "/vendor/xterm.js": ("@xterm/xterm/lib/xterm.js", "text/javascript; charset=utf-8"),
+    "/vendor/xterm.css": ("@xterm/xterm/css/xterm.css", "text/css; charset=utf-8"),
+    "/vendor/addon-fit.js": ("@xterm/addon-fit/lib/addon-fit.js", "text/javascript; charset=utf-8"),
+}
+
+
+def node_modules_dir() -> str:
+    candidates = [os.environ.get("WEBUI_XTERM_DIR", ""), "/usr/local/lib/node_modules"]
+    candidates += os.environ.get("NODE_PATH", "").split(os.pathsep)
+    for candidate in candidates:
+        if candidate and os.path.isfile(os.path.join(candidate, VENDOR_FILES["/vendor/xterm.js"][0])):
+            return candidate
+    return ""
 
 
 def _env(name: str, default: str = "") -> str:
@@ -111,7 +136,9 @@ class Handler(BaseHTTPRequestHandler):
         self.send_header("X-Frame-Options", "DENY")
         self.send_header(
             "Content-Security-Policy",
-            "default-src 'none'; script-src 'self'; style-src 'self'; img-src 'self' data:; connect-src 'self'; "
+            # xterm.js injects <style> elements; scripts stay 'self' only
+            "default-src 'none'; script-src 'self'; style-src 'self' 'unsafe-inline'; img-src 'self' data:; "
+            "font-src 'self' data:; connect-src 'self'; "
             "base-uri 'none'; form-action 'none'; frame-ancestors 'none'",
         )
         for name, value in headers.items():
@@ -149,12 +176,14 @@ class Handler(BaseHTTPRequestHandler):
         user, _, password = decoded.partition(":")
         return hmac.compare_digest(user, expected[0]) and hmac.compare_digest(password, expected[1])
 
-    def _same_origin(self) -> bool:
+    def _same_origin(self, required: bool = False) -> bool:
         origin = self.headers.get("Origin")
         if not origin:
-            return True
+            return not required
         host = self.headers.get("Host", "")
-        return origin.split("://", 1)[-1] == host
+        # a reverse proxy may rewrite Host: WEBUI_ALLOWED_ORIGINS lists the public origins
+        allowed = {item.strip().rstrip("/") for item in _env("WEBUI_ALLOWED_ORIGINS").split(",") if item.strip()}
+        return origin.rstrip("/") in allowed or (bool(host) and origin.split("://", 1)[-1] == host)
 
     # --- routing -------------------------------------------------------------------------------
 
@@ -174,16 +203,36 @@ class Handler(BaseHTTPRequestHandler):
         if not self._authorized():
             self._unauthorized()
             return
-        path = self.path.split("?", 1)[0]
+        path, _, query = self.path.partition("?")
         if path in STATIC_FILES:
-            self._serve_static(*STATIC_FILES[path])
+            self._serve_static(os.path.join(STATIC_DIR, STATIC_FILES[path][0]), STATIC_FILES[path][1])
+            return
+        if path in VENDOR_FILES:
+            base = node_modules_dir()
+            if not base:
+                self._error(HTTPStatus.NOT_FOUND, "xterm.js is not installed (WEBUI_XTERM_DIR)")
+                return
+            self._serve_static(os.path.join(base, VENDOR_FILES[path][0]), VENDOR_FILES[path][1], cache=True)
             return
         if path == "/api/health":
             self._json(HTTPStatus.OK, {"status": "ok", "version": VERSION, "config": self._public_config()})
             return
+        if path == "/api/terminal":
+            self._terminal(query)
+            return
+        if path in ("/api/system", "/api/agents"):
+            try:
+                payload = system_stats.system_payload() if path == "/api/system" else system_stats.agents_payload()
+            except Exception as exc:  # noqa: BLE001 - report collection failures instead of dying
+                self._error(HTTPStatus.INTERNAL_SERVER_ERROR, f"collection failed: {exc}")
+                return
+            if path == "/api/agents":
+                payload["terminals"] = terminal.sessions_info()
+            self._json(HTTPStatus.OK, payload)
+            return
         if path == "/api/workspaces":
             try:
-                payload = store.snapshot()
+                payload = store.snapshot(force="refresh=1" in query.split("&"))
             except Exception as exc:  # noqa: BLE001 - report scan failures instead of dying
                 self._error(HTTPStatus.INTERNAL_SERVER_ERROR, f"scan failed: {exc}")
                 return
@@ -255,28 +304,99 @@ class Handler(BaseHTTPRequestHandler):
             "refresh_seconds": _env_int("WEBUI_REFRESH_SECONDS", 15),
             "auth": self.server.auth is not None,  # type: ignore[attr-defined]
             "version": VERSION,
-            "read_only": _env("WEBUI_READ_ONLY").strip().lower() in ("1", "true", "yes", "on"),
+            "read_only": self.server.read_only,  # type: ignore[attr-defined]
+            "blind_grace_seconds": cfg["blind_grace_seconds"],
+            "shell": self.server.shell_enabled(),  # type: ignore[attr-defined]
+            "shell_reason": self.server.shell_reason(),  # type: ignore[attr-defined]
+            "xterm": bool(node_modules_dir()),
+            "home": os.environ.get("HOME", ""),
         }
 
-    def _serve_static(self, name: str, content_type: str) -> None:
-        path = os.path.join(STATIC_DIR, name)
+    def _serve_static(self, path: str, content_type: str, cache: bool = False) -> None:
         try:
             with open(path, "rb") as handle:
                 body = handle.read()
         except OSError:
             self._error(HTTPStatus.NOT_FOUND, "missing static file")
             return
-        self._send(HTTPStatus.OK, body, content_type, {"Cache-Control": "no-store"})
+        self._send(HTTPStatus.OK, body, content_type, {"Cache-Control": "max-age=3600" if cache else "no-store"})
+
+    def _terminal(self, query: str) -> None:
+        """Upgrade to a WebSocket and run a PTY session (see terminal.py)."""
+        if not self.server.shell_enabled():  # type: ignore[attr-defined]
+            self._error(HTTPStatus.FORBIDDEN, f"terminal disabled: {self.server.shell_reason()}")  # type: ignore[attr-defined]
+            return
+        # a WebSocket is not subject to CORS: the Origin must be present and ours (CSWSH guard)
+        if not self._same_origin(required=True):
+            self._error(HTTPStatus.FORBIDDEN, "missing or foreign Origin")
+            return
+        key = self.headers.get("Sec-WebSocket-Key", "")
+        if (
+            "websocket" not in self.headers.get("Upgrade", "").lower()
+            or "upgrade" not in self.headers.get("Connection", "").lower()
+            or self.headers.get("Sec-WebSocket-Version") != "13"
+            or not key
+        ):
+            self._error(HTTPStatus.BAD_REQUEST, "WebSocket upgrade expected")
+            return
+        params = urllib.parse.parse_qs(query)
+
+        def param(name: str, default: str = "") -> str:
+            return (params.get(name) or [default])[0]
+
+        mode = "tmux" if param("mode") == "tmux" else "shell"
+        cwd = os.environ.get("HOME") or "/"
+        if param("dir") and param("task"):
+            try:
+                task_path = store.find_task_dir(param("dir"), param("task"))
+            except store.DeleteError as exc:
+                self._error(exc.status, str(exc))
+                return
+            workdir = os.path.join(task_path, "workdir")
+            cwd = workdir if os.path.isdir(workdir) else task_path
+        try:
+            cols, rows = int(param("cols", "120")), int(param("rows", "32"))
+        except ValueError:
+            cols, rows = 120, 32
+        self.send_response(HTTPStatus.SWITCHING_PROTOCOLS)
+        self.send_header("Upgrade", "websocket")
+        self.send_header("Connection", "Upgrade")
+        self.send_header("Sec-WebSocket-Accept", terminal.WebSocket.accept_key(key))
+        self.end_headers()
+        self.wfile.flush()
+        self.close_connection = True
+        terminal.serve(self, mode, cwd, cols, rows, _env_int("WEBUI_SHELL_MAX", 8))
 
 
 class Server(ThreadingHTTPServer):
     daemon_threads = True
     allow_reuse_address = True
 
-    def __init__(self, address: tuple[str, int], auth: tuple[str, str] | None, read_only: bool):
+    def __init__(
+        self, address: tuple[str, int], auth: tuple[str, str] | None, read_only: bool, shell: bool | None = None
+    ):
         self.auth = auth
         self.read_only = read_only
+        # the terminal is a full shell as the agent: on by default, off with WEBUI_SHELL=0 or read-only
+        self.shell = shell if shell is not None else _env("WEBUI_SHELL", "1").strip().lower() not in ("0", "false", "no", "off")
         super().__init__(address, Handler)
+
+    def handle_error(self, request, client_address) -> None:  # noqa: ANN001 - socketserver API
+        # a browser closing a kept-alive connection is not an error worth a traceback
+        exc = sys.exc_info()[1]
+        if isinstance(exc, (ConnectionResetError, BrokenPipeError, TimeoutError)):
+            return
+        super().handle_error(request, client_address)
+
+    def shell_enabled(self) -> bool:
+        return self.shell and not self.read_only
+
+    def shell_reason(self) -> str:
+        if self.read_only:
+            return "read-only mode (WEBUI_READ_ONLY)"
+        if not self.shell:
+            return "disabled by WEBUI_SHELL=0"
+        return ""
 
 
 def main(argv: list[str] | None = None) -> int:
@@ -301,13 +421,14 @@ def main(argv: list[str] | None = None) -> int:
 
     read_only = _env("WEBUI_READ_ONLY").strip().lower() in ("1", "true", "yes", "on")
     if read_only:
-        sys.stderr.write("[webui] read-only mode: deletion is disabled\n")
+        sys.stderr.write("[webui] read-only mode: deletion and the terminal are disabled\n")
 
     root = store.workspaces_root()
     if not os.path.isdir(root):
         sys.stderr.write(f"[webui] warning: workspaces root {root} does not exist yet\n")
 
     server = Server((args.bind, args.port), auth, read_only)
+    system_stats.sampler()  # start collecting resource history right away
 
     def stop(signum, _frame):  # noqa: ANN001 - signal handler signature
         sys.stderr.write(f"[webui] signal {signum}, stopping\n")
@@ -318,8 +439,8 @@ def main(argv: list[str] | None = None) -> int:
 
     sys.stderr.write(
         f"[webui] multica-agent-runtime web UI {VERSION} on http://{args.bind}:{server.server_address[1]}/ "
-        f"(root {root}, auth {'on' if auth else 'off'}"
-        f"{', read-only' if read_only else ''})\n"
+        f"(root {root}, auth {'on' if auth else 'off'}, terminal {'on' if server.shell_enabled() else 'off'}"
+        f"{', read-only' if read_only else ''}, xterm {node_modules_dir() or 'missing'})\n"
     )
     try:
         server.serve_forever(poll_interval=0.5)

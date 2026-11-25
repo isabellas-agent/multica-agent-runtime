@@ -6,8 +6,8 @@
 #   shell             web terminal (ttyd) on $TTYD_PORT: login shell, `?arg=tmux` for the tmux
 #                     session `main`; uses an existing
 #                     Docker daemon (the daemon container of the same pod), never starts one
-#   webui             management web UI on $WEBUI_PORT (8090): lists the workspace data under
-#                     $MULTICA_WORKSPACES_ROOT and deletes workspaces that are not in use
+#   webui             management web UI on $WEBUI_PORT (8090): agent tasks, resource usage, workspace
+#                     cleanup (data under $MULTICA_WORKSPACES_ROOT that is not in use), browser terminals
 #   doctor [--gpu]    runtime-doctor
 #   <command>         runs the command after the same setup (DIND_MODE default off)
 #

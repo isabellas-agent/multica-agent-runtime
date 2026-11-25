@@ -5,22 +5,22 @@ The Multica daemon keeps the data of every workspace under one root
 (`MULTICA_WORKSPACES_ROOT`, default `/data/workspaces`):
 
     /data/workspaces/<slug>-<last 12 hex of the workspace id>/   one directory per workspace
-      home-<issue>-<token>/     one directory per task (run)
-      .repos/                   git repo cache, shared by all workspaces
+      home-<issue>-<token>/     one directory per task (run): .task_lock, .task_owner, workdir/ ...
+    /data/workspaces/.repos/    git repo cache, shared by all workspaces (never listed)
 
-Deleting such a directory is safe while no task of that workspace runs: the daemon recreates it
-on the next task. Everything in this module is aimed at one rule:
+Deleting a task directory, or a whole workspace directory, is safe while no task in it runs: the
+daemon creates new directories for the next task. Everything in this module is aimed at one rule:
 
-    never delete a workspace that is (or looks) in use.
+    never delete anything that is (or looks) in use.
 
-Three independent signals are collected for that (see `_detect_in_use`):
+Signals, collected per task directory (a workspace is in use when one of its tasks is):
 
-1. a live process of this host has its working directory (or an open file) inside the workspace —
-   this is what a running agent task looks like;
-2. the workspace was modified within `WEBUI_ACTIVITY_GRACE` seconds (the safety net for a webui
-   that runs on another host or in another PID namespace than the daemon);
-3. the daemon reports running tasks and the workspace holds a task directory whose `.task_lock`
-   is flock()ed at this moment (only when the lock is visible in `/proc/locks`).
+1. a live process has its working directory (or an open file) inside it - a running agent task;
+2. its `.task_lock` is locked at this moment (`/proc/locks`);
+3. it was modified within `WEBUI_ACTIVITY_GRACE` seconds;
+4. "blind" mode: when this process cannot see the daemon's processes (another container without
+   a shared PID namespace, another pod), 1 and 2 see nothing. Then, unless the daemon reports that
+   no task runs, everything modified within `WEBUI_BLIND_GRACE` seconds (6 h) counts as in use.
 
 Nothing here needs the Multica server. Names come from the optional `multica workspace list`.
 """
@@ -29,6 +29,8 @@ from __future__ import annotations
 
 import json
 import os
+import re
+import secrets
 import stat
 import subprocess
 import threading
@@ -74,6 +76,7 @@ def _env_bool(name: str, default: bool) -> bool:
 DEFAULT_ROOT = "/data/workspaces"
 INFRA_DIRS = {".repos", ".webui-trash"}
 
+
 # root directory of the workspace data (WEBUI_WORKSPACES_ROOT wins over the daemon's variable)
 def workspaces_root() -> str:
     root = _env("WEBUI_WORKSPACES_ROOT") or _env("MULTICA_WORKSPACES_ROOT") or DEFAULT_ROOT
@@ -84,6 +87,7 @@ def config() -> dict[str, Any]:
     return {
         "root": workspaces_root(),
         "activity_grace_seconds": _env_int("WEBUI_ACTIVITY_GRACE", 300),
+        "blind_grace_seconds": _env_int("WEBUI_BLIND_GRACE", 6 * 3600),
         "scan_budget_seconds": _env_int("WEBUI_SCAN_BUDGET", 120),
         "cache_seconds": _env_int("WEBUI_CACHE_SECONDS", 8),
         "trash": _env_bool("WEBUI_TRASH", True),
@@ -91,7 +95,6 @@ def config() -> dict[str, Any]:
         "protect": sorted(protected_workspaces()),
         "daemon_url": daemon_url(),
         "resolve_names": _env_bool("WEBUI_RESOLVE_NAMES", True),
-        "filesystem_id": _filesystem_id(),
     }
 
 
@@ -112,15 +115,6 @@ def trash_dir(root: str) -> str:
     return os.path.join(root, ".webui-trash")
 
 
-def _filesystem_id() -> str:
-    """Filesystem id of the root (major:minor), so /proc/locks inodes can be matched."""
-    try:
-        st = os.stat(workspaces_root())
-    except OSError:
-        return ""
-    return f"{os.major(st.st_dev)}:{os.minor(st.st_dev)}"
-
-
 # --- helpers -----------------------------------------------------------------------------------
 
 _BYTES_UNITS = ("B", "KiB", "MiB", "GiB", "TiB", "PiB")
@@ -135,22 +129,51 @@ def human_bytes(num: float) -> str:
     return f"{value:.1f} PiB"
 
 
+def _dev_id(st: os.stat_result) -> str:
+    """Device of a stat result as /proc/locks prints it: hex `major:minor`, two digits each."""
+    return f"{os.major(st.st_dev):02x}:{os.minor(st.st_dev):02x}"
+
+
 @dataclass
 class TaskDir:
     name: str
     path: str
     size_bytes: int = 0
     newest_mtime: float = 0.0
+    created: float = 0.0
     locked: bool = False
+    task_id: str = ""
+    issue_id: str = ""
+    agent_id: str = ""
     processes: list[dict[str, Any]] = field(default_factory=list)
+    in_use: bool = False
+    reasons: list[str] = field(default_factory=list)
+    protected: bool = False
+
+    @property
+    def deletable(self) -> bool:
+        return not self.in_use and not self.protected
 
     def as_dict(self) -> dict[str, Any]:
+        age = max(0.0, time.time() - self.newest_mtime) if self.newest_mtime else None
         return {
             "name": self.name,
+            "path": self.path,
             "size_bytes": self.size_bytes,
+            "size": human_bytes(self.size_bytes),
             "newest_mtime": self.newest_mtime,
+            "created": self.created,
+            "last_activity_seconds": age,
             "locked": self.locked,
+            "task_id": self.task_id,
+            "issue_id": self.issue_id,
+            "agent_id": self.agent_id,
             "processes": self.processes,
+            "in_use": self.in_use,
+            "protected": self.protected,
+            "deletable": self.deletable,
+            "reasons": self.reasons,
+            "has_workdir": os.path.isdir(os.path.join(self.path, "workdir")),
         }
 
 
@@ -164,6 +187,7 @@ class Workspace:
     size_bytes: int = 0
     newest_mtime: float = 0.0
     oldest_mtime: float = 0.0
+    own_newest_mtime: float = 0.0  # files of the workspace directory outside the task directories
     partial: bool = False
     tasks: list[TaskDir] = field(default_factory=list)
     processes: list[dict[str, Any]] = field(default_factory=list)
@@ -188,6 +212,9 @@ class Workspace:
             "size": human_bytes(self.size_bytes),
             "task_count": len(self.tasks),
             "tasks": [task.as_dict() for task in self.tasks],
+            "tasks_in_use": sum(1 for task in self.tasks if task.in_use),
+            "tasks_deletable": sum(1 for task in self.tasks if task.deletable),
+            "tasks_deletable_size_bytes": sum(task.size_bytes for task in self.tasks if task.deletable),
             "newest_mtime": self.newest_mtime,
             "last_activity_seconds": age,
             "partial": self.partial,
@@ -217,15 +244,15 @@ def _walk_size(path: str, deadline: float) -> tuple[int, float, bool]:
             with os.scandir(current) as entries:
                 for entry in entries:
                     try:
-                        if entry.is_dir(follow_symlinks=False):
-                            stack.append(entry.path)
-                        elif entry.is_file(follow_symlinks=False):
-                            st = entry.stat(follow_symlinks=False)
-                            size += st.st_size
-                            if st.st_mtime > newest:
-                                newest = st.st_mtime
+                        st = entry.stat(follow_symlinks=False)
                     except OSError:
                         continue
+                    if st.st_mtime > newest:
+                        newest = st.st_mtime
+                    if stat.S_ISDIR(st.st_mode):
+                        stack.append(entry.path)
+                    elif stat.S_ISREG(st.st_mode):
+                        size += st.st_size
         except OSError:
             partial = partial or current != path
     try:
@@ -263,10 +290,20 @@ def _skip_process_pids() -> set[int]:
     return pids
 
 
+def _own_terminal_pids() -> set[int]:
+    """Process trees of the webui's own terminal sessions (they are the user, not a task)."""
+    try:
+        import terminal  # noqa: PLC0415 - optional, avoids an import cycle
+
+        return terminal.session_pids()
+    except Exception:  # noqa: BLE001 - terminal support is optional
+        return set()
+
+
 def _proc_cmdline(pid: int) -> str:
     try:
         with open(f"/proc/{pid}/cmdline", "rb") as handle:
-            raw = handle.read(512)
+            raw = handle.read(1024)
     except OSError:
         return ""
     return raw.replace(b"\0", b" ").decode("utf-8", "replace").strip()
@@ -286,6 +323,7 @@ def _scan_processes(roots: Iterable[str]) -> list[dict[str, Any]]:
     if not roots:
         return []
     skip = _skip_process_pids()
+    own_terminals = _own_terminal_pids()
     found: list[dict[str, Any]] = []
     try:
         proc_entries = os.listdir("/proc")
@@ -304,7 +342,7 @@ def _scan_processes(roots: Iterable[str]) -> list[dict[str, Any]]:
             pass
         try:
             fd_dir = f"/proc/{pid}/fd"
-            for fd in os.listdir(fd_dir)[:256]:
+            for fd in os.listdir(fd_dir)[:4096]:
                 try:
                     target = os.readlink(f"{fd_dir}/{fd}")
                 except OSError:
@@ -324,28 +362,39 @@ def _scan_processes(roots: Iterable[str]) -> list[dict[str, Any]]:
                     "name": _proc_name(pid),
                     "cmd": _proc_cmdline(pid)[:200],
                     "path": match,
+                    "terminal": pid in own_terminals,
                 }
             )
     return found
 
 
-def _locked_inodes() -> set[tuple[str, int]]:
-    """Advisory write locks currently held, as (major:minor, inode) from /proc/locks."""
+_LOCK_DEV_INODE = re.compile(r"^([0-9a-fA-F]+):([0-9a-fA-F]+):(\d+)$")
+
+
+def _locked_inodes() -> tuple[set[tuple[str, int]], set[int]]:
+    """Locks held right now, from /proc/locks: ({(major:minor, inode)}, {inode}).
+
+    A line looks like `40: FLOCK  ADVISORY  WRITE 443 00:9b:279660 0 EOF` (waiters carry an extra
+    `->`); every lock type (FLOCK, POSIX, OFDLCK, LEASE) and mode counts. The device is printed in
+    hex. Only locks of processes in this PID namespace are listed by the kernel.
+    """
     locked: set[tuple[str, int]] = set()
+    inodes: set[int] = set()
     try:
         with open("/proc/locks", "rb") as handle:
             lines = handle.read().decode("utf-8", "replace").splitlines()
     except OSError:
-        return locked
+        return locked, inodes
     for line in lines:
-        parts = line.split()
-        if len(parts) < 6 or parts[1] != "ADVISORY" or parts[2] != "WRITE":
-            continue
-        try:
-            locked.add((parts[4], int(parts[5])))
-        except (IndexError, ValueError):
-            continue
-    return locked
+        for token in line.split():
+            match = _LOCK_DEV_INODE.match(token)
+            if match:
+                dev = f"{int(match.group(1), 16):02x}:{int(match.group(2), 16):02x}"
+                inode = int(match.group(3))
+                locked.add((dev, inode))
+                inodes.add(inode)
+                break
+    return locked, inodes
 
 
 def _workspace_id_from_dir(dir_name: str, ids_by_suffix: dict[str, str]) -> str:
@@ -353,50 +402,54 @@ def _workspace_id_from_dir(dir_name: str, ids_by_suffix: dict[str, str]) -> str:
     return ids_by_suffix.get(suffix.lower(), "")
 
 
+_names_cache: dict[str, Any] = {}
+_names_lock = threading.Lock()
+
+
 def _workspace_names() -> dict[str, dict[str, str]]:
     """id -> {name, slug} from the Multica server, empty when unavailable (offline, no login)."""
-    cache = _names_cache.get("data")
-    if cache is not None and time.monotonic() - cache["at"] < 300:
-        return cache["value"]
-    value: dict[str, dict[str, str]] = {}
-    if _env_bool("WEBUI_RESOLVE_NAMES", True):
-        try:
-            proc = subprocess.run(
-                ["multica", "workspace", "list", "--output", "json"],
-                capture_output=True,
-                timeout=_env_int("WEBUI_NAMES_TIMEOUT", 15),
-                check=False,
-            )
-            if proc.returncode == 0:
-                for item in json.loads(proc.stdout.decode("utf-8", "replace")):
-                    if isinstance(item, dict) and item.get("id"):
-                        value[str(item["id"])] = {
-                            "name": str(item.get("name") or ""),
-                            "slug": str(item.get("slug") or ""),
-                        }
-        except (OSError, ValueError, subprocess.SubprocessError):
-            value = {}
-    _names_cache["data"] = {"at": time.monotonic(), "value": value}
-    return value
+    with _names_lock:
+        cache = _names_cache.get("data")
+        if cache is not None and time.monotonic() - cache["at"] < 300:
+            return cache["value"]
+        value: dict[str, dict[str, str]] = {}
+        if _env_bool("WEBUI_RESOLVE_NAMES", True):
+            try:
+                proc = subprocess.run(
+                    ["multica", "workspace", "list", "--output", "json"],
+                    capture_output=True,
+                    timeout=_env_int("WEBUI_NAMES_TIMEOUT", 15),
+                    check=False,
+                )
+                if proc.returncode == 0:
+                    items = json.loads(proc.stdout.decode("utf-8", "replace"))
+                    for item in items if isinstance(items, list) else []:
+                        if isinstance(item, dict) and item.get("id"):
+                            value[str(item["id"])] = {
+                                "name": str(item.get("name") or ""),
+                                "slug": str(item.get("slug") or ""),
+                            }
+            except (OSError, ValueError, subprocess.SubprocessError):
+                value = {}
+        _names_cache["data"] = {"at": time.monotonic(), "value": value}
+        return value
 
-
-_names_cache: dict[str, Any] = {}
 
 _daemon_cache: dict[str, Any] = {}
 
 
-def daemon_status(timeout: float = 2.0) -> dict[str, Any]:
+def daemon_status(timeout: float = 2.0, fresh: bool = False) -> dict[str, Any]:
     """The daemon's local /health endpoint, when it is reachable from here."""
     url = daemon_url()
     cached = _daemon_cache.get("data")
-    if cached is not None and time.monotonic() - cached["at"] < 3:
+    if not fresh and cached is not None and time.monotonic() - cached["at"] < 3:
         return cached["value"]
     status: dict[str, Any] = {"reachable": False, "url": url}
     if url:
         try:
-            import urllib.request
+            import urllib.request  # noqa: PLC0415
 
-            with urllib.request.urlopen(f"{url}/health", timeout=timeout) as response:
+            with urllib.request.urlopen(f"{url}/health", timeout=timeout) as response:  # noqa: S310 - local URL
                 payload = json.loads(response.read(1 << 20).decode("utf-8", "replace"))
             if isinstance(payload, dict):
                 status.update(
@@ -407,8 +460,12 @@ def daemon_status(timeout: float = 2.0) -> dict[str, Any]:
                         "device_name": payload.get("device_name"),
                         "uptime": payload.get("uptime"),
                         "cli_version": payload.get("cli_version"),
+                        "server_url": payload.get("server_url"),
+                        "pid": payload.get("pid"),
+                        "agents": payload.get("agents") or [],
                         "running_task_count": payload.get("running_task_count"),
                         "active_task_count": payload.get("active_task_count"),
+                        "resource_wait_task_count": payload.get("resource_wait_task_count"),
                         "workspaces": payload.get("workspaces") or [],
                     }
                 )
@@ -418,33 +475,114 @@ def daemon_status(timeout: float = 2.0) -> dict[str, Any]:
     return status
 
 
-def _detect_in_use(
-    workspace: Workspace, programs: list[dict[str, Any]], locked: set[tuple[str, int]], cfg: dict[str, Any]
-) -> None:
-    reasons: list[str] = []
-    prefix = workspace.path + os.sep
-    procs = [p for p in programs if p["path"] == workspace.path or str(p["path"]).startswith(prefix)]
-    if procs:
-        workspace.processes = procs
-        names = sorted({p["name"] or str(p["pid"]) for p in procs})
-        reasons.append(f"running process ({', '.join(names[:4])})")
+def _daemon_process_visible() -> bool:
+    """True when the Multica daemon's process is visible in this PID namespace."""
+    try:
+        entries = os.listdir("/proc")
+    except OSError:
+        return False
+    own = os.getpid()
+    for entry in entries:
+        if not entry.isdigit() or int(entry) == own:
+            continue
+        try:
+            with open(f"/proc/{entry}/cmdline", "rb") as handle:
+                argv = handle.read(512).split(b"\0")
+        except OSError:
+            continue
+        if argv and os.path.basename(argv[0]) == b"multica" and b"daemon" in argv[1:3]:
+            return True
+    return False
 
+
+def process_view(daemon: dict[str, Any] | None = None) -> dict[str, Any]:
+    """Whether processes and locks of running tasks are visible from here (see module docstring)."""
+    daemon = daemon if daemon is not None else daemon_status()
+    visible = _daemon_process_visible()
+    running = daemon.get("running_task_count") if daemon.get("reachable") else None
+    if visible:
+        mode = "full"
+    elif _env_bool("WEBUI_ASSUME_SHARED_PID", False):
+        mode = "full"
+    else:
+        mode = "blind"
+    # blind and nothing tells us that no task runs: fall back to the long grace period
+    strict = mode == "blind" and not (isinstance(running, int) and running == 0)
+    return {
+        "mode": mode,
+        "daemon_visible": visible,
+        "daemon_running_tasks": running,
+        "strict": strict,
+        "blind_grace_seconds": _env_int("WEBUI_BLIND_GRACE", 6 * 3600),
+    }
+
+
+def _under(path: str, root: str) -> bool:
+    return path == root or path.startswith(root + os.sep)
+
+
+def _detect_in_use(
+    workspace: Workspace,
+    programs: list[dict[str, Any]],
+    locks: tuple[set[tuple[str, int]], set[int]],
+    cfg: dict[str, Any],
+    view: dict[str, Any],
+) -> None:
+    locked, locked_inodes = locks
+    grace = int(cfg["activity_grace_seconds"])
+    blind_grace = int(cfg["blind_grace_seconds"]) if view.get("strict") else 0
+    now = time.time()
+
+    def activity_reasons(newest: float) -> list[str]:
+        if not newest:
+            return []
+        age = now - newest
+        if grace > 0 and age < grace:
+            return [f"modified {max(0, int(age))}s ago (grace {grace}s)"]
+        if blind_grace > 0 and age < blind_grace:
+            return [
+                f"modified {int(age // 60)} min ago and running tasks are not visible from here "
+                f"(blind grace {blind_grace // 3600:g} h)"
+            ]
+        return []
+
+    def process_reason(procs: list[dict[str, Any]]) -> list[str]:
+        if not procs:
+            return []
+        names = sorted({p["name"] or str(p["pid"]) for p in procs})
+        label = "web terminal" if all(p.get("terminal") for p in procs) else "running process"
+        return [f"{label} ({', '.join(names[:4])})"]
+
+    workspace_procs = [p for p in programs if _under(str(p["path"]), workspace.path)]
+    workspace.processes = workspace_procs
     for task in workspace.tasks:
+        reasons: list[str] = []
+        task.processes = [p for p in workspace_procs if _under(str(p["path"]), task.path)]
+        reasons += process_reason(task.processes)
         try:
             st = os.stat(os.path.join(task.path, ".task_lock"))
-            inode = (f"{os.major(st.st_dev)}:{os.minor(st.st_dev)}", st.st_ino)
+            key = (_dev_id(st), st.st_ino)
         except OSError:
-            inode = None
-        if inode and inode in locked:
+            key = None
+        # the device of an inode can differ between stat() and /proc/locks (btrfs subvolumes,
+        # overlay): an inode-only hit counts too - a false "in use" is the safe direction
+        if key and (key in locked or key[1] in locked_inodes):
             task.locked = True
-            reasons.append(f"task lock held ({task.name})")
+            reasons.append("task lock held")
+        reasons += activity_reasons(task.newest_mtime)
+        task.reasons = reasons
+        task.in_use = bool(reasons)
+        task.protected = workspace.protected
 
-    grace = int(cfg["activity_grace_seconds"])
-    if grace > 0 and workspace.newest_mtime:
-        age = time.time() - workspace.newest_mtime
-        if age < grace:
-            reasons.append(f"modified {max(0, int(age))}s ago (grace {grace}s)")
-
+    reasons: list[str] = []
+    loose = [p for p in workspace_procs if not any(_under(str(p["path"]), t.path) for t in workspace.tasks)]
+    reasons += process_reason(loose)
+    busy = [task for task in workspace.tasks if task.in_use]
+    for task in busy[:3]:
+        reasons.append(f"{task.name}: {task.reasons[0]}")
+    if len(busy) > 3:
+        reasons.append(f"{len(busy) - 3} more tasks in use")
+    reasons += activity_reasons(workspace.own_newest_mtime)
     workspace.reasons = reasons
     workspace.in_use = bool(reasons)
 
@@ -457,12 +595,36 @@ def _names_index() -> tuple[dict[str, dict[str, str]], dict[str, str]]:
     return names, ids_by_suffix
 
 
+def _listdir(path: str) -> list[str]:
+    try:
+        return sorted(os.listdir(path))
+    except OSError:
+        return []
+
+
+def _scan_task(name: str, path: str, deadline: float) -> tuple[TaskDir, bool]:
+    task = TaskDir(name=name, path=path)
+    task.size_bytes, task.newest_mtime, partial = _walk_size(path, deadline)
+    try:
+        st = os.stat(path)
+        task.created = min(st.st_mtime, st.st_ctime)
+    except OSError:
+        pass
+    owner = _read_json(os.path.join(path, ".task_owner"))
+    env = _read_json(os.path.join(path, ".managed_env.json"))
+    task.task_id = str(owner.get("task_id") or "")
+    task.issue_id = str(env.get("issue_id") or "")
+    task.agent_id = str(env.get("agent_id") or "")
+    return task, partial
+
+
 def _scan_workspace(
     entry: str,
     cfg: dict[str, Any],
     deadline: float,
     names: dict[str, dict[str, str]],
     ids_by_suffix: dict[str, str],
+    only_task: str | None = None,
 ) -> Workspace | None:
     """Size, tasks and identity of one workspace directory (no in-use detection)."""
     path = os.path.join(cfg["root"], entry)
@@ -473,9 +635,10 @@ def _scan_workspace(
         return None
 
     workspace = Workspace(dir_name=entry, path=path)
+    children = _listdir(path)
     workspace.workspace_id = _workspace_id_from_dir(entry, ids_by_suffix)
     if not workspace.workspace_id:
-        for task_name in sorted(os.listdir(path)):
+        for task_name in children:
             if task_name.startswith(".") or task_name in INFRA_DIRS:
                 continue
             owner = _read_json(os.path.join(path, task_name, ".task_owner"))
@@ -486,12 +649,14 @@ def _scan_workspace(
     workspace.name = meta.get("name", "")
     workspace.slug = meta.get("slug", "") or (entry.rsplit("-", 1)[0] if "-" in entry else entry)
 
-    oldest: list[float] = []
     try:
-        children = sorted(os.listdir(path))
+        workspace.own_newest_mtime = os.stat(path, follow_symlinks=False).st_mtime
     except OSError:
-        children = []
+        pass
+    created: list[float] = []
     for child in children:
+        if only_task is not None and child != only_task:
+            continue
         child_path = os.path.join(path, child)
         try:
             is_dir = stat.S_ISDIR(os.lstat(child_path).st_mode)
@@ -500,20 +665,19 @@ def _scan_workspace(
         if child.startswith(".") or child in INFRA_DIRS or not is_dir:
             size, newest, partial = _walk_size(child_path, deadline)
             workspace.size_bytes += size
-            workspace.newest_mtime = max(workspace.newest_mtime, newest)
+            workspace.own_newest_mtime = max(workspace.own_newest_mtime, newest)
             workspace.partial = workspace.partial or partial
             continue
-        task = TaskDir(name=child, path=child_path)
-        task.size_bytes, task.newest_mtime, partial = _walk_size(child_path, deadline)
+        task, partial = _scan_task(child, child_path, deadline)
         workspace.partial = workspace.partial or partial
         workspace.size_bytes += task.size_bytes
         workspace.newest_mtime = max(workspace.newest_mtime, task.newest_mtime)
-        try:
-            oldest.append(os.stat(child_path).st_mtime)
-        except OSError:
-            pass
+        if task.created:
+            created.append(task.created)
         workspace.tasks.append(task)
-    workspace.oldest_mtime = min(oldest) if oldest else workspace.newest_mtime
+    workspace.newest_mtime = max(workspace.newest_mtime, workspace.own_newest_mtime)
+    workspace.oldest_mtime = min(created) if created else workspace.newest_mtime
+    workspace.tasks.sort(key=lambda item: item.newest_mtime, reverse=True)
 
     identifiers = {
         entry,
@@ -525,80 +689,102 @@ def _scan_workspace(
     return workspace
 
 
+_cache: dict[str, Any] = {}
+_scan_lock = threading.Lock()
+
+
 def snapshot(force: bool = False) -> dict[str, Any]:
     """All workspaces with size, activity and in-use state (cached for `WEBUI_CACHE_SECONDS`)."""
     cfg = config()
-    cached = _cache.get("data")
-    if not force and cached is not None and time.monotonic() - cached["at"] < cfg["cache_seconds"]:
-        return cached["value"]
+    with _scan_lock:  # one scan at a time; concurrent requests get the fresh result
+        cached = _cache.get("data")
+        if not force and cached is not None and time.monotonic() - cached["at"] < cfg["cache_seconds"]:
+            return cached["value"]
 
-    root = cfg["root"]
-    started = time.monotonic()
-    deadline = started + max(5, int(cfg["scan_budget_seconds"]))
+        root = cfg["root"]
+        started = time.monotonic()
+        deadline = started + max(5, int(cfg["scan_budget_seconds"]))
+        names, ids_by_suffix = _names_index()
+
+        workspaces: list[Workspace] = []
+        for entry in _listdir(root):
+            if entry.startswith(".") or entry in INFRA_DIRS:
+                continue
+            workspace = _scan_workspace(entry, cfg, deadline, names, ids_by_suffix)
+            if workspace is not None:
+                workspaces.append(workspace)
+
+        daemon = daemon_status()
+        view = process_view(daemon)
+        programs = _scan_processes([workspace.path for workspace in workspaces])
+        locks = _locked_inodes()
+        for workspace in workspaces:
+            _detect_in_use(workspace, programs, locks, cfg, view)
+
+        workspaces.sort(key=lambda item: item.size_bytes, reverse=True)
+        deletable = [workspace for workspace in workspaces if workspace.deletable]
+        tasks = [task for workspace in workspaces for task in workspace.tasks]
+        idle_tasks = [task for task in tasks if task.deletable]
+        payload = {
+            "root": root,
+            "generated_at": time.time(),
+            "scan_seconds": round(time.monotonic() - started, 3),
+            "grace_seconds": cfg["activity_grace_seconds"],
+            "protect": sorted(cfg["protect"]),
+            "daemon": daemon,
+            "process_view": view,
+            "workspaces": [workspace.as_dict() for workspace in workspaces],
+            "totals": {
+                "workspace_count": len(workspaces),
+                "task_count": len(tasks),
+                "size_bytes": sum(workspace.size_bytes for workspace in workspaces),
+                "size": human_bytes(sum(workspace.size_bytes for workspace in workspaces)),
+                "in_use_count": sum(1 for workspace in workspaces if workspace.in_use),
+                "tasks_in_use": sum(1 for task in tasks if task.in_use),
+                "deletable_count": len(deletable),
+                "deletable_size_bytes": sum(workspace.size_bytes for workspace in deletable),
+                "deletable_size": human_bytes(sum(workspace.size_bytes for workspace in deletable)),
+                "deletable_task_count": len(idle_tasks),
+                "deletable_task_size_bytes": sum(task.size_bytes for task in idle_tasks),
+                "deletable_task_size": human_bytes(sum(task.size_bytes for task in idle_tasks)),
+            },
+        }
+        _cache["data"] = {"at": time.monotonic(), "value": payload}
+        return payload
+
+
+def _fresh_state(dir_name: str, task: str | None = None) -> Workspace | None:
+    """One workspace (or one of its tasks), scanned on its own right before deleting."""
+    cfg = config()
     names, ids_by_suffix = _names_index()
-
-    try:
-        entries = sorted(os.listdir(root))
-    except OSError:
-        entries = []
-
-    workspaces: list[Workspace] = []
-    for entry in entries:
-        if entry.startswith(".") or entry in INFRA_DIRS:
-            continue
-        workspace = _scan_workspace(entry, cfg, deadline, names, ids_by_suffix)
-        if workspace is not None:
-            workspaces.append(workspace)
-
-    programs = _scan_processes([workspace.path for workspace in workspaces])
-    locked = _locked_inodes()
-    for workspace in workspaces:
-        _detect_in_use(workspace, programs, locked, cfg)
-
-    workspaces.sort(key=lambda item: item.size_bytes, reverse=True)
-    daemon = daemon_status()
-    deletable = [workspace for workspace in workspaces if workspace.deletable]
-    payload = {
-        "root": root,
-        "generated_at": time.time(),
-        "scan_seconds": round(time.monotonic() - started, 3),
-        "grace_seconds": cfg["activity_grace_seconds"],
-        "protect": sorted(cfg["protect"]),
-        "daemon": daemon,
-        "workspaces": [workspace.as_dict() for workspace in workspaces],
-        "totals": {
-            "workspace_count": len(workspaces),
-            "task_count": sum(len(workspace.tasks) for workspace in workspaces),
-            "size_bytes": sum(workspace.size_bytes for workspace in workspaces),
-            "size": human_bytes(sum(workspace.size_bytes for workspace in workspaces)),
-            "in_use_count": sum(1 for workspace in workspaces if workspace.in_use),
-            "deletable_count": len(deletable),
-            "deletable_size_bytes": sum(workspace.size_bytes for workspace in deletable),
-            "deletable_size": human_bytes(sum(workspace.size_bytes for workspace in deletable)),
-        },
-    }
-    _cache["data"] = {"at": time.monotonic(), "value": payload}
-    return payload
+    deadline = time.monotonic() + max(5, int(cfg["scan_budget_seconds"]))
+    workspace = _scan_workspace(dir_name, cfg, deadline, names, ids_by_suffix, only_task=task)
+    if workspace is None:
+        return None
+    view = process_view(daemon_status(fresh=True))
+    _detect_in_use(workspace, _scan_processes([workspace.path]), _locked_inodes(), cfg, view)
+    return workspace
 
 
 def workspace_state(dir_name: str) -> dict[str, Any] | None:
     """State of a single workspace directory, scanned on its own (used right before deleting)."""
-    cfg = config()
-    names, ids_by_suffix = _names_index()
-    deadline = time.monotonic() + max(5, int(cfg["scan_budget_seconds"]))
-    workspace = _scan_workspace(dir_name, cfg, deadline, names, ids_by_suffix)
-    if workspace is None:
-        return None
-    _detect_in_use(workspace, _scan_processes([workspace.path]), _locked_inodes(), cfg)
-    return workspace.as_dict()
-
-
-_cache: dict[str, Any] = {}
+    workspace = _fresh_state(dir_name)
+    return workspace.as_dict() if workspace else None
 
 
 def invalidate() -> None:
     _cache.pop("data", None)
     _daemon_cache.pop("data", None)
+
+
+def find_task_dir(dir_name: str, task: str) -> str:
+    """Validated absolute path of `<root>/<dir>/<task>` (for the terminal's working directory)."""
+    _validate_name(dir_name, "workspace directory")
+    _validate_name(task, "task directory")
+    path = os.path.join(workspaces_root(), dir_name, task)
+    if not os.path.isdir(path) or os.path.islink(path):
+        raise DeleteError("task directory does not exist", status=404)
+    return path
 
 
 # --- deletion ----------------------------------------------------------------------------------
@@ -611,68 +797,89 @@ class DeleteError(Exception):
         self.reasons = reasons or []
 
 
-def _validate_dir_name(dir_name: str) -> None:
-    if not isinstance(dir_name, str) or not dir_name:
-        raise DeleteError("workspace directory is required")
-    if dir_name in (".", "..") or dir_name.startswith(".") or "/" in dir_name or "\\" in dir_name:
-        raise DeleteError("invalid workspace directory")
-    root = workspaces_root()
-    path = os.path.join(root, dir_name)
-    if os.path.realpath(os.path.dirname(path)) != os.path.realpath(root):
-        raise DeleteError("workspace directory is outside the workspaces root")
+def _validate_name(name: Any, what: str) -> None:
+    if not isinstance(name, str) or not name:
+        raise DeleteError(f"{what} is required")
+    if name in (".", "..") or name.startswith(".") or "/" in name or "\\" in name or "\0" in name:
+        raise DeleteError(f"invalid {what}")
+
+
+def _validate_dir(parent: str, name: str, what: str) -> str:
+    _validate_name(name, what)
+    path = os.path.join(parent, name)
+    if os.path.realpath(os.path.dirname(path)) != os.path.realpath(parent):
+        raise DeleteError(f"{what} is outside the workspaces root")
     try:
-        if not stat.S_ISDIR(os.lstat(path).st_mode):
-            raise DeleteError("not a directory")
+        mode = os.lstat(path).st_mode
     except OSError:
-        raise DeleteError("workspace directory does not exist", status=404)
+        raise DeleteError(f"{what} does not exist", status=404) from None
+    if not stat.S_ISDIR(mode):
+        raise DeleteError("not a directory")
+    return path
+
+
+def _validate_dir_name(dir_name: str) -> None:
+    _validate_dir(workspaces_root(), dir_name, "workspace directory")
 
 
 def _rmtree_force(path: str) -> list[str]:
-    """Remove a tree, fixing permissions where possible; returns paths that survived.
+    """Remove a tree, fixing permissions of our own directories; returns paths that survived.
 
-    Files a nested (rootful) container created as root cannot be removed by the agent user; they
-    stay in the trash and are reported instead of failing the whole request.
+    Symlinks are removed, never followed or chmod()ed. Files a nested (rootful) container created
+    as root cannot be removed by the agent user; they stay in the trash and are reported instead of
+    failing the whole request.
     """
     surviving: list[str] = []
+    uid = os.getuid()
 
-    def remove(target: str, remove_fn) -> None:  # noqa: ANN001 - callable passed in
+    def fix_dir(target: str) -> None:
         try:
-            remove_fn(target)
-            return
+            st = os.lstat(target)
+            if stat.S_ISDIR(st.st_mode) and st.st_uid == uid and (st.st_mode & 0o700) != 0o700:
+                os.chmod(target, stat.S_IMODE(st.st_mode) | 0o700)
         except OSError:
             pass
-        for mode in (0o700, 0o600):
-            try:
-                os.chmod(os.path.dirname(target), 0o700)
-                os.chmod(target, mode)
-                remove_fn(target)
-                return
-            except OSError:
-                continue
-        surviving.append(target)
+
+    # top-down: make our directories listable and writable so their content can be removed
+    fix_dir(path)
+    for current, dirs, _files in os.walk(path, topdown=True, onerror=lambda _exc: None):
+        for name in dirs:
+            fix_dir(os.path.join(current, name))
 
     for current, dirs, files in os.walk(path, topdown=False, onerror=lambda _exc: None):
         for name in files:
-            remove(os.path.join(current, name), os.unlink)
+            target = os.path.join(current, name)
+            try:
+                os.unlink(target)
+            except FileNotFoundError:
+                pass
+            except OSError:
+                surviving.append(target)
         for name in dirs:
             target = os.path.join(current, name)
-            if os.path.islink(target):
-                remove(target, os.unlink)
-            else:
-                remove(target, os.rmdir)
-    remove(path, os.rmdir)
+            try:
+                if os.path.islink(target):
+                    os.unlink(target)
+                else:
+                    os.rmdir(target)
+            except FileNotFoundError:
+                pass
+            except OSError:
+                surviving.append(target)
+    try:
+        os.rmdir(path)
+    except FileNotFoundError:
+        pass
+    except OSError:
+        surviving.append(path)
     return surviving[:20]
 
 
 def _purge_trash(root: str, keep_hours: float) -> None:
     """Drop trash entries; `keep_hours` 0 removes them right away."""
     path = trash_dir(root)
-    try:
-        entries = os.listdir(path)
-    except OSError:
-        return
     now = time.time()
-    for entry in entries:
+    for entry in _listdir(path):
         entry_path = os.path.join(path, entry)
         try:
             age_hours = (now - os.lstat(entry_path).st_mtime) / 3600
@@ -685,49 +892,82 @@ def _purge_trash(root: str, keep_hours: float) -> None:
                 continue
 
 
-def delete_workspace(dir_name: str, confirm: str, dry_run: bool = False) -> dict[str, Any]:
-    """Delete one workspace's data directory. Raises DeleteError when that is not safe."""
-    _validate_dir_name(dir_name)
-    if not isinstance(confirm, str) or confirm.strip() != dir_name:
-        raise DeleteError("confirmation does not match the workspace directory")
-
-    cfg = config()
-    current = workspace_state(dir_name)
-    if current is None:
-        raise DeleteError("workspace directory does not exist", status=404)
-    if current["protected"]:
-        raise DeleteError("workspace is protected by WEBUI_PROTECT_WORKSPACES", status=403)
-    if current["in_use"]:
-        raise DeleteError("workspace is in use", status=409, reasons=current["reasons"])
-
+def _remove(path: str, label: str, cfg: dict[str, Any], result: dict[str, Any]) -> None:
     root = cfg["root"]
-    path = os.path.join(root, dir_name)
-    result = {
-        "dir": dir_name,
-        "size_bytes": current["size_bytes"],
-        "size": human_bytes(current["size_bytes"]),
-        "dry_run": dry_run,
-        "trashed": False,
-        "leftovers": [],
-    }
-    if dry_run:
-        return result
-
     staging = path
     if cfg["trash"]:
         trash = trash_dir(root)
-        staging = os.path.join(trash, f"{dir_name}.{int(time.time())}")
+        staging = os.path.join(trash, f"{label}.{time.strftime('%Y%m%d-%H%M%S')}.{secrets.token_hex(3)}")
         try:
             os.makedirs(trash, mode=0o700, exist_ok=True)
             os.rename(path, staging)  # atomic: the daemon never sees a half-deleted directory
             os.utime(staging, None)
             result["trashed"] = True
         except OSError as exc:
-            raise DeleteError(f"could not move the workspace into the trash: {exc.strerror}", status=500)
+            raise DeleteError(f"could not move the directory into the trash: {exc.strerror}", status=500) from exc
     result["leftovers"] = _rmtree_force(staging)
     if cfg["trash"]:
         _purge_trash(root, float(cfg["keep_trash_hours"]))
     invalidate()
+
+
+def delete_workspace(dir_name: str, confirm: str, dry_run: bool = False) -> dict[str, Any]:
+    """Delete one workspace's data directory. Raises DeleteError when that is not safe."""
+    path = _validate_dir(workspaces_root(), dir_name, "workspace directory")
+    if not isinstance(confirm, str) or confirm.strip() != dir_name:
+        raise DeleteError("confirmation does not match the workspace directory")
+
+    cfg = config()
+    current = _fresh_state(dir_name)
+    if current is None:
+        raise DeleteError("workspace directory does not exist", status=404)
+    if current.protected:
+        raise DeleteError("workspace is protected by WEBUI_PROTECT_WORKSPACES", status=403)
+    if current.in_use:
+        raise DeleteError("workspace is in use", status=409, reasons=current.reasons)
+
+    result = {
+        "dir": dir_name,
+        "task": None,
+        "size_bytes": current.size_bytes,
+        "size": human_bytes(current.size_bytes),
+        "dry_run": dry_run,
+        "trashed": False,
+        "leftovers": [],
+    }
+    if not dry_run:
+        _remove(path, dir_name, cfg, result)
+    return result
+
+
+def delete_task(dir_name: str, task: str, confirm: str, dry_run: bool = False) -> dict[str, Any]:
+    """Delete one task directory of a workspace. Raises DeleteError when that is not safe."""
+    workspace_path = _validate_dir(workspaces_root(), dir_name, "workspace directory")
+    path = _validate_dir(workspace_path, task, "task directory")
+    if not isinstance(confirm, str) or confirm.strip() != task:
+        raise DeleteError("confirmation does not match the task directory")
+
+    cfg = config()
+    current = _fresh_state(dir_name, task)
+    entry = next((item for item in current.tasks if item.name == task), None) if current else None
+    if current is None or entry is None:
+        raise DeleteError("task directory does not exist", status=404)
+    if entry.protected:
+        raise DeleteError("workspace is protected by WEBUI_PROTECT_WORKSPACES", status=403)
+    if entry.in_use:
+        raise DeleteError("task is in use", status=409, reasons=entry.reasons)
+
+    result = {
+        "dir": dir_name,
+        "task": task,
+        "size_bytes": entry.size_bytes,
+        "size": human_bytes(entry.size_bytes),
+        "dry_run": dry_run,
+        "trashed": False,
+        "leftovers": [],
+    }
+    if not dry_run:
+        _remove(path, f"{dir_name}__{task}", cfg, result)
     return result
 
 
@@ -735,11 +975,11 @@ _delete_lock = threading.Lock()
 
 
 def delete_many(items: Any, dry_run: bool = False) -> dict[str, Any]:
-    """Delete several workspaces; per-item results, a failure never aborts the others."""
+    """Delete workspaces (`{"dir"}`) or task directories (`{"dir", "task"}`); per-item results."""
     if not isinstance(items, list) or not items:
-        raise DeleteError("no workspaces selected")
-    if len(items) > 100:
-        raise DeleteError("too many workspaces selected at once")
+        raise DeleteError("nothing selected")
+    if len(items) > 200:
+        raise DeleteError("too many items selected at once")
     deleted: list[dict[str, Any]] = []
     failed: list[dict[str, Any]] = []
     skipped: list[dict[str, Any]] = []
@@ -747,13 +987,19 @@ def delete_many(items: Any, dry_run: bool = False) -> dict[str, Any]:
     with _delete_lock:
         for item in items:
             if not isinstance(item, dict):
-                failed.append({"dir": "", "error": "invalid request item"})
+                failed.append({"dir": "", "task": None, "error": "invalid request item", "status": 400})
                 continue
             dir_name = str(item.get("dir") or "")
+            task = item.get("task")
+            task = str(task) if task else None
+            confirm = str(item.get("confirm") or "")
             try:
-                result = delete_workspace(dir_name, str(item.get("confirm") or ""), dry_run=dry_run)
+                if task is None:
+                    result = delete_workspace(dir_name, confirm, dry_run=dry_run)
+                else:
+                    result = delete_task(dir_name, task, confirm, dry_run=dry_run)
                 deleted.append(result)
             except DeleteError as exc:
-                entry = {"dir": dir_name, "error": str(exc), "status": exc.status, "reasons": exc.reasons}
+                entry = {"dir": dir_name, "task": task, "error": str(exc), "status": exc.status, "reasons": exc.reasons}
                 (skipped if exc.status in (403, 409) else failed).append(entry)
     return {"deleted": deleted, "failed": failed, "skipped": skipped, "dry_run": dry_run}

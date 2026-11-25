@@ -1,20 +1,24 @@
 #!/usr/bin/env python3
 # shellcheck shell=python
-"""Functional test of the workspace cleanup web UI (standard library only).
+"""Functional test of the management web UI (standard library only).
 
     python3 tests/webui.py            # from the repo, or /tests/webui.py inside the image
 
 It builds a throw-away workspaces root, so it never touches real data: an idle workspace, a
-protected one and one with a live process in it. Run by tests/smoke.sh.
+protected one and one with a live process in it; plus the terminal WebSocket and the status
+endpoints. Run by tests/smoke.sh.
 """
 
 from __future__ import annotations
 
 import base64
+import fcntl
 import http.client
 import json
 import os
 import shutil
+import socket
+import struct
 import subprocess
 import sys
 import tempfile
@@ -55,6 +59,7 @@ os.environ.update(
 )
 
 import server as webui_server  # noqa: E402
+import system_stats  # noqa: E402
 import workspace_store as store  # noqa: E402
 
 OLD = time.time() - 3 * 86400
@@ -63,8 +68,8 @@ OLD = time.time() - 3 * 86400
 def age_tree(path: str, mtime: float = OLD) -> None:
     """Give everything below `path` (and the directories) an old mtime."""
     for current, dirs, files in os.walk(path, topdown=False):
-        for name in files:
-            os.utime(os.path.join(current, name), (mtime, mtime))
+        for name in files + [d for d in dirs if os.path.islink(os.path.join(current, d))]:
+            os.utime(os.path.join(current, name), (mtime, mtime), follow_symlinks=False)
         os.utime(current, (mtime, mtime))
 
 
@@ -208,6 +213,107 @@ class WorkspaceStoreTest(unittest.TestCase):
             store.delete_many([])
 
 
+    def test_lock_parsing_and_detection(self) -> None:
+        target = make_workspace("lock-121212121212")
+        lock_path = os.path.join(target, "home-1-0123456789ab", ".task_lock")
+        # this process holds the lock (and is skipped by the process scan): only the lock signal fires
+        with open(lock_path, "r+", encoding="utf-8") as handle:
+            fcntl.flock(handle, fcntl.LOCK_EX)
+            st = os.stat(lock_path)
+            locked, inodes = store._locked_inodes()
+            self.assertIn((store._dev_id(st), st.st_ino), locked)
+            self.assertIn(st.st_ino, inodes)
+            item = self.by_dir(store.snapshot(force=True))["lock-121212121212"]
+            self.assertTrue(item["in_use"])
+            self.assertTrue(item["tasks"][0]["locked"])
+            self.assertIn("task lock held", item["tasks"][0]["reasons"])
+            with self.assertRaises(store.DeleteError) as raised:
+                store.delete_task("lock-121212121212", "home-1-0123456789ab", "home-1-0123456789ab")
+            self.assertEqual(raised.exception.status, 409)
+            fcntl.flock(handle, fcntl.LOCK_UN)
+        item = self.by_dir(store.snapshot(force=True))["lock-121212121212"]
+        self.assertFalse(item["in_use"], item["reasons"])
+        shutil.rmtree(target, ignore_errors=True)
+
+    def test_task_deletion(self) -> None:
+        target = make_workspace("multi-131313131313", task="home-1-111111111111")
+        make_workspace("multi-131313131313", task="home-2-222222222222")
+        busy_dir = os.path.join(target, "home-2-222222222222", "workdir")
+        proc = subprocess.Popen([sys.executable, "-c", "import time; time.sleep(60)"], cwd=busy_dir)
+        try:
+            time.sleep(0.3)
+            item = self.by_dir(store.snapshot(force=True))["multi-131313131313"]
+            tasks = {task["name"]: task for task in item["tasks"]}
+            self.assertTrue(item["in_use"])
+            self.assertEqual(item["tasks_in_use"], 1)
+            self.assertTrue(tasks["home-1-111111111111"]["deletable"])
+            self.assertFalse(tasks["home-2-222222222222"]["deletable"])
+            with self.assertRaises(store.DeleteError) as raised:
+                store.delete_workspace("multi-131313131313", "multi-131313131313")
+            self.assertEqual(raised.exception.status, 409)
+            with self.assertRaises(store.DeleteError):
+                store.delete_task("multi-131313131313", "home-1-111111111111", "wrong")
+            with self.assertRaises(store.DeleteError):
+                store.delete_task("multi-131313131313", "../alpha-111111111111", "../alpha-111111111111")
+            result = store.delete_many(
+                [
+                    {"dir": "multi-131313131313", "task": "home-1-111111111111", "confirm": "home-1-111111111111"},
+                    {"dir": "multi-131313131313", "task": "home-2-222222222222", "confirm": "home-2-222222222222"},
+                ]
+            )
+            self.assertEqual([entry["task"] for entry in result["deleted"]], ["home-1-111111111111"])
+            self.assertEqual([entry["task"] for entry in result["skipped"]], ["home-2-222222222222"])
+            self.assertFalse(os.path.exists(os.path.join(target, "home-1-111111111111")))
+            self.assertTrue(os.path.isdir(busy_dir))
+        finally:
+            proc.terminate()
+            proc.wait(timeout=10)
+            shutil.rmtree(target, ignore_errors=True)
+
+    def test_blind_mode_uses_long_grace(self) -> None:
+        target = make_workspace("blind-141414141414")
+        age_tree(target, time.time() - 3600)  # an hour old: past the normal grace, within the blind one
+        try:
+            view = store.process_view()
+            self.assertEqual(view["mode"], "blind")  # no daemon process in this test
+            self.assertTrue(view["strict"])  # and no daemon that reports 0 running tasks
+            item = self.by_dir(store.snapshot(force=True))["blind-141414141414"]
+            self.assertTrue(item["in_use"])
+            self.assertTrue(any("blind grace" in reason for reason in item["tasks"][0]["reasons"]))
+            os.environ["WEBUI_ASSUME_SHARED_PID"] = "1"
+            item = self.by_dir(store.snapshot(force=True))["blind-141414141414"]
+            self.assertTrue(item["deletable"], item["reasons"])
+        finally:
+            os.environ.pop("WEBUI_ASSUME_SHARED_PID", None)
+            shutil.rmtree(target, ignore_errors=True)
+
+    def test_delete_never_follows_symlinks(self) -> None:
+        outside = tempfile.mkdtemp(prefix="webui-outside-")
+        secret = os.path.join(outside, "secret.txt")
+        with open(secret, "w", encoding="utf-8") as handle:
+            handle.write("keep me")
+        os.chmod(secret, 0o400)
+        target = make_workspace("link-151515151515")
+        workdir = os.path.join(target, "home-1-0123456789ab", "workdir")
+        os.symlink(secret, os.path.join(workdir, "file-link"))
+        os.symlink(outside, os.path.join(workdir, "dir-link"))
+        locked_dir = os.path.join(workdir, "readonly")
+        os.makedirs(locked_dir)
+        with open(os.path.join(locked_dir, "x"), "w", encoding="utf-8") as handle:
+            handle.write("x")
+        os.chmod(locked_dir, 0o500)
+        age_tree(target)
+        try:
+            result = store.delete_workspace("link-151515151515", "link-151515151515")
+            self.assertEqual(result["leftovers"], [])
+            self.assertFalse(os.path.exists(target))
+            self.assertTrue(os.path.isfile(secret))
+            self.assertEqual(os.stat(secret).st_mode & 0o777, 0o400)
+        finally:
+            os.chmod(secret, 0o600)
+            shutil.rmtree(outside, ignore_errors=True)
+
+
 class HttpApiTest(unittest.TestCase):
     @classmethod
     def setUpClass(cls) -> None:
@@ -256,10 +362,18 @@ class HttpApiTest(unittest.TestCase):
     def test_index_and_assets(self) -> None:
         status, headers, body = self.request("GET", "/", headers=self.basic("admin", "s3cret"))
         self.assertEqual(status, 200)
-        self.assertIn(b"Workspace cleanup", body)
+        self.assertIn(b"Runtime management", body)
         csp = dict((name.lower(), value) for name, value in headers)["content-security-policy"]
         self.assertIn("default-src 'none'", csp)
-        for asset, needle in (("/app.js", b"runDelete"), ("/style.css", b"--accent"), ("/favicon.svg", b"<svg")):
+        assets = (
+            ("/app.js", b"registerView"),
+            ("/workspaces.js", b"runDelete"),
+            ("/overview.js", b"sparkline"),
+            ("/terminal.js", b"WebSocket"),
+            ("/style.css", b"--accent"),
+            ("/favicon.svg", b"<svg"),
+        )
+        for asset, needle in assets:
             status, _, body = self.request("GET", asset, headers=self.basic("admin", "s3cret"))
             self.assertEqual(status, 200)
             self.assertIn(needle, body)
@@ -321,6 +435,111 @@ class HttpApiTest(unittest.TestCase):
         )
         self.assertIn(status, (207, 404))
 
+    def test_status_endpoints(self) -> None:
+        system_stats.sampler().sample()
+        status, _, body = self.request("GET", "/api/system", headers=self.basic("admin", "s3cret"))
+        self.assertEqual(status, 200, body)
+        payload = json.loads(body)
+        for key in ("host", "cgroup", "processes", "network", "filesystems", "history", "top"):
+            self.assertIn(key, payload)
+        self.assertGreater(payload["processes"]["count"], 0)
+        self.assertTrue(payload["history"])
+        status, _, body = self.request("GET", "/api/agents", headers=self.basic("admin", "s3cret"))
+        self.assertEqual(status, 200, body)
+        payload = json.loads(body)
+        for key in ("daemon", "process_view", "tasks", "docker", "terminals"):
+            self.assertIn(key, payload)
+        self.assertFalse(payload["daemon"]["reachable"])
+
+    def test_agent_cli_detection(self) -> None:
+        cases = {
+            ("/usr/local/lib/node_modules/@anthropic-ai/claude-code/bin/claude.exe", "-p"): "claude",
+            ("node", "/usr/local/bin/pi", "--mode", "rpc"): "pi",
+            ("node", "/usr/local/lib/node_modules/@openai/codex/bin/codex.js", "exec"): "codex",
+            ("/usr/local/bin/omp",): "omp",
+            ("bwrap", "--die-with-parent", "--", "claude"): None,
+            ("node", "/usr/local/bin/playwright-mcp"): None,
+        }
+        for argv, expected in cases.items():
+            with self.subTest(argv=argv):
+                self.assertEqual(system_stats._agent_cli(list(argv)), expected)
+
+    # --- terminal ------------------------------------------------------------------------------
+
+    def ws_connect(self, origin: str | None, port: int | None = None, auth: bool = True) -> tuple[socket.socket, bytes]:
+        port = port or self.port
+        sock = socket.create_connection(("127.0.0.1", port), timeout=15)
+        key = base64.b64encode(os.urandom(16)).decode()
+        lines = [
+            "GET /api/terminal?mode=shell&cols=100&rows=30 HTTP/1.1",
+            f"Host: 127.0.0.1:{port}",
+            "Upgrade: websocket",
+            "Connection: Upgrade",
+            f"Sec-WebSocket-Key: {key}",
+            "Sec-WebSocket-Version: 13",
+        ]
+        if origin:
+            lines.append(f"Origin: {origin}")
+        if auth:
+            lines.append("Authorization: " + self.basic("admin", "s3cret")["Authorization"])
+        sock.sendall(("\r\n".join(lines) + "\r\n\r\n").encode())
+        head = b""
+        while b"\r\n\r\n" not in head:
+            chunk = sock.recv(4096)
+            if not chunk:
+                break
+            head += chunk
+        return sock, head
+
+    @staticmethod
+    def ws_send(sock: socket.socket, opcode: int, payload: bytes) -> None:
+        mask = os.urandom(4)
+        masked = bytes(byte ^ mask[index % 4] for index, byte in enumerate(payload))
+        length = len(payload)
+        header = struct.pack("!BB", 0x80 | opcode, 0x80 | length) if length < 126 else struct.pack("!BBH", 0x80 | opcode, 0x80 | 126, length)
+        sock.sendall(header + mask + masked)
+
+    @staticmethod
+    def ws_read_until(sock: socket.socket, needle: bytes, timeout: float = 15) -> bytes:
+        data = b""
+        deadline = time.time() + timeout
+        while needle not in data and time.time() < deadline:
+            try:
+                chunk = sock.recv(65536)
+            except socket.timeout:
+                break
+            if not chunk:
+                break
+            data += chunk
+        return data
+
+    def test_terminal_requires_same_origin(self) -> None:
+        sock, head = self.ws_connect(origin=None)
+        sock.close()
+        self.assertIn(b" 403 ", head.split(b"\r\n", 1)[0])
+        sock, head = self.ws_connect(origin="http://evil.example")
+        sock.close()
+        self.assertIn(b" 403 ", head.split(b"\r\n", 1)[0])
+        sock, head = self.ws_connect(origin=f"http://127.0.0.1:{self.port}", auth=False)
+        sock.close()
+        self.assertIn(b" 401 ", head.split(b"\r\n", 1)[0])
+
+    @unittest.skipUnless(shutil.which("setsid") and shutil.which("bash"), "needs setsid and bash")
+    def test_terminal_session(self) -> None:
+        sock, head = self.ws_connect(origin=f"http://127.0.0.1:{self.port}")
+        try:
+            self.assertIn(b" 101 ", head.split(b"\r\n", 1)[0], head)
+            self.ws_send(sock, 0x1, json.dumps({"type": "resize", "cols": 90, "rows": 20}).encode())
+            self.ws_send(sock, 0x2, b"echo webui-$((6*7)); stty size\n")
+            data = self.ws_read_until(sock, b"20 90")
+            self.assertIn(b"webui-42", data)
+            self.assertIn(b"20 90", data)
+            self.ws_send(sock, 0x2, b"exit\n")
+            data = self.ws_read_until(sock, b'"exit"')
+            self.assertIn(b'"type": "exit"', data)
+        finally:
+            sock.close()
+
     def test_read_only_server(self) -> None:
         server = webui_server.Server(("127.0.0.1", 0), None, True)
         thread = threading.Thread(target=server.serve_forever, daemon=True)
@@ -337,6 +556,10 @@ class HttpApiTest(unittest.TestCase):
             response.read()
             connection.close()
             self.assertEqual(response.status, 403)
+            port = server.server_address[1]
+            sock, head = self.ws_connect(origin=f"http://127.0.0.1:{port}", port=port, auth=False)
+            sock.close()
+            self.assertIn(b" 403 ", head.split(b"\r\n", 1)[0])
         finally:
             server.shutdown()
             server.server_close()

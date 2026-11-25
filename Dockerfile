@@ -163,12 +163,19 @@ ARG PLAYWRIGHT_MCP_VERSION=0.0.86
 ARG CHROME_DEVTOOLS_MCP_VERSION=1.14.0
 # renovate: datasource=npm depName=pnpm
 ARG PNPM_VERSION=12.23.0
+# terminal of the management web UI (served from node_modules, no build step)
+# renovate: datasource=npm depName=@xterm/xterm
+ARG XTERM_VERSION=6.0.0
+# renovate: datasource=npm depName=@xterm/addon-fit
+ARG XTERM_FIT_VERSION=0.11.0
 ENV PLAYWRIGHT_BROWSERS_PATH=/opt/ms-playwright
 RUN npm install --global --prefix /usr/local --no-fund --no-audit \
     "@playwright/test@${PLAYWRIGHT_VERSION}" \
     "@playwright/mcp@${PLAYWRIGHT_MCP_VERSION}" \
     "chrome-devtools-mcp@${CHROME_DEVTOOLS_MCP_VERSION}" \
-    "pnpm@${PNPM_VERSION}"; \
+    "pnpm@${PNPM_VERSION}" \
+    "@xterm/xterm@${XTERM_VERSION}" "@xterm/addon-fit@${XTERM_FIT_VERSION}"; \
+  test -f /usr/local/lib/node_modules/@xterm/xterm/lib/xterm.js; \
   playwright install ffmpeg; \
   chown -R 1000:1000 /opt/ms-playwright; \
   npm cache clean --force; \
@@ -250,6 +257,7 @@ ENV HOME=/home/agent \
     VISUAL=vim \
     TTYD_PORT=7681 \
     WEBUI_PORT=8090 \
+    TINI_SUBREAPER=1 \
     MULTICA_AGENT_RUNTIME_VARIANT=${VARIANT}
 
 USER 1000:1000
