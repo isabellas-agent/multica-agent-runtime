@@ -6,6 +6,8 @@
 #   shell             web terminal (ttyd) on $TTYD_PORT: login shell, `?arg=tmux` for the tmux
 #                     session `main`; uses an existing
 #                     Docker daemon (the daemon container of the same pod), never starts one
+#   webui             management web UI on $WEBUI_PORT (8090): lists the workspace data under
+#                     $MULTICA_WORKSPACES_ROOT and deletes workspaces that are not in use
 #   doctor [--gpu]    runtime-doctor
 #   <command>         runs the command after the same setup (DIND_MODE default off)
 #
@@ -34,7 +36,7 @@ LIB=/usr/local/lib/multica-agent-runtime
 cmd=${1:-daemon}
 case "$cmd" in
   daemon) : "${DIND_MODE:=auto}" ;;
-  shell) DIND_MODE=external ;;
+  shell | webui) DIND_MODE=external ;;
   *) : "${DIND_MODE:=off}" ;;
 esac
 export DIND_MODE
@@ -102,12 +104,24 @@ run_shell() {
   exec ttyd --writable --port "$TTYD_PORT" --check-origin --url-arg ${TTYD_ARGS:-} "$LIB/web-shell.sh"
 }
 
+run_webui() {
+  # optional: register the token so workspace names resolve (the daemon container does its own login)
+  if [ "${WEBUI_LOGIN:-}" = 1 ] && is_set MULTICA_TOKEN; then
+    multica login --token "$MULTICA_TOKEN" || warn "multica login failed: workspace names stay unresolved"
+  fi
+  exec python3 "$LIB/webui/server.py" "$@"
+}
+
 case "$cmd" in
   daemon)
     shift || true
     run_daemon "$@"
     ;;
   shell) run_shell ;;
+  webui)
+    shift || true
+    run_webui "$@"
+    ;;
   doctor)
     shift
     exec runtime-doctor "$@"
