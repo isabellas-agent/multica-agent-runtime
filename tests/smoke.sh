@@ -109,6 +109,7 @@ grep -q 'Runtime management' "$OUT/webui-index.html" || fail "webui does not ser
 curl -fsS -o /dev/null http://127.0.0.1:18090/vendor/xterm.js || fail "webui does not serve xterm.js"
 curl -fsS http://127.0.0.1:18090/api/system | jq -e '.processes.count > 0' >/dev/null || fail "webui /api/system"
 curl -fsS http://127.0.0.1:18090/api/agents | jq -e 'has("tasks") and has("process_view")' >/dev/null || fail "webui /api/agents"
+curl -fsS 'http://127.0.0.1:18090/api/env?source=webui' | jq -e '.count > 0' >/dev/null || fail "webui /api/env"
 curl -fsS -o "$OUT/webui-workspaces.json" http://127.0.0.1:18090/api/workspaces || fail "webui API is not reachable"
 jq -e '.workspaces | length == 2 and (map(.deletable) | any) and (map(.in_use) | any)' \
   "$OUT/webui-workspaces.json" >/dev/null || fail "webui API does not report the expected workspaces"

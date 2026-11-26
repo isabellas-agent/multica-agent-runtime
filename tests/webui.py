@@ -58,6 +58,7 @@ os.environ.update(
     }
 )
 
+import env_vars  # noqa: E402
 import server as webui_server  # noqa: E402
 import system_stats  # noqa: E402
 import workspace_store as store  # noqa: E402
@@ -370,6 +371,7 @@ class HttpApiTest(unittest.TestCase):
             ("/workspaces.js", b"runDelete"),
             ("/overview.js", b"sparkline"),
             ("/terminal.js", b"WebSocket"),
+            ("/env.js", b"revealValue"),
             ("/style.css", b"--accent"),
             ("/favicon.svg", b"<svg"),
         )
@@ -450,6 +452,67 @@ class HttpApiTest(unittest.TestCase):
         for key in ("daemon", "process_view", "tasks", "docker", "terminals"):
             self.assertIn(key, payload)
         self.assertFalse(payload["daemon"]["reachable"])
+
+    def test_env_masking_rules(self) -> None:
+        secret = {
+            "MULTICA_TOKEN": "mul_abcdef",
+            "GH_TOKEN": "ghp_" + "a" * 36,
+            "OPENAI_API_KEY": "sk-x",
+            "AWS_SECRET_ACCESS_KEY": "x",
+            "DB_PASSWORD": "x",
+            "WEBUI_AUTH": "admin:pw",
+            "WEBUI_AUTH_FILE": "/run/secret",
+            "SOMETHING": "ghp_" + "b" * 36,  # token-looking value under a harmless name
+        }
+        plain = {"PWD": "/home/agent", "PATH": "/usr/bin", "SSH_AUTH_SOCK": "/run/ssh", "GIT_SSH_KEY_PATH": "/k", "EMPTY_TOKEN": ""}
+        for name, value in secret.items():
+            with self.subTest(name=name):
+                is_secret, shown = env_vars.classify(name, value)
+                self.assertTrue(is_secret)
+                self.assertNotIn(value, shown)
+        for name, value in plain.items():
+            with self.subTest(name=name):
+                self.assertEqual(env_vars.classify(name, value), (False, value))
+        is_secret, shown = env_vars.classify("PIP_INDEX_URL", "https://user:hunter2@proxy.lan:8443/simple")
+        self.assertTrue(is_secret)
+        self.assertNotIn("hunter2", shown)
+        self.assertIn("user:", shown)
+        self.assertIn("proxy.lan:8443/simple", shown)
+
+    def test_env_view_and_reveal(self) -> None:
+        os.environ["DEMO_API_TOKEN"] = "s3cr3t-value"
+        os.environ["DEMO_PLAIN"] = "visible"
+        os.environ["WEBUI_AUTH"] = "admin:s3cret"  # what the real server runs with
+        try:
+            auth = self.basic("admin", "s3cret")
+            status, _, body = self.request("GET", "/api/env/sources", headers=auth)
+            self.assertEqual(status, 200)
+            self.assertEqual(json.loads(body)["sources"][0]["id"], "webui")
+            status, _, body = self.request("GET", "/api/env?source=webui", headers=auth)
+            self.assertEqual(status, 200)
+            self.assertNotIn(b"s3cr3t-value", body)
+            self.assertNotIn(b"admin:s3cret", body)
+            variables = {item["name"]: item for item in json.loads(body)["variables"]}
+            self.assertTrue(variables["DEMO_API_TOKEN"]["secret"])
+            self.assertEqual(variables["DEMO_PLAIN"]["value"], "visible")
+
+            reveal = {"source": "webui", "name": "DEMO_API_TOKEN"}
+            status, _, _ = self.request("POST", "/api/env/reveal", reveal, auth)  # no CSRF header
+            self.assertEqual(status, 403)
+            headers = {**auth, "X-WebUI": "1"}
+            status, _, body = self.request("POST", "/api/env/reveal", reveal, headers)
+            self.assertEqual(status, 200)
+            self.assertEqual(json.loads(body)["value"], "s3cr3t-value")
+            status, _, _ = self.request("POST", "/api/env/reveal", {"source": "webui", "name": "WEBUI_AUTH"}, headers)
+            self.assertEqual(status, 403)
+            # only the daemon and agent tasks, never an arbitrary process
+            status, _, _ = self.request("GET", f"/api/env?source=pid:{os.getpid()}", headers=auth)
+            self.assertEqual(status, 404)
+            status, _, _ = self.request("POST", "/api/env/reveal", {"source": "pid:1", "name": "PATH"}, headers)
+            self.assertEqual(status, 404)
+        finally:
+            for name in ("DEMO_API_TOKEN", "DEMO_PLAIN", "WEBUI_AUTH"):
+                os.environ.pop(name, None)
 
     def test_agent_cli_detection(self) -> None:
         cases = {
@@ -557,6 +620,17 @@ class HttpApiTest(unittest.TestCase):
             connection.close()
             self.assertEqual(response.status, 403)
             port = server.server_address[1]
+            connection = http.client.HTTPConnection("127.0.0.1", port, timeout=30)
+            connection.request(
+                "POST",
+                "/api/env/reveal",
+                body=json.dumps({"source": "webui", "name": "PATH"}),
+                headers={"Content-Type": "application/json", "X-WebUI": "1"},
+            )
+            response = connection.getresponse()
+            response.read()
+            connection.close()
+            self.assertEqual(response.status, 403)  # read-only: masked listing only
             sock, head = self.ws_connect(origin=f"http://127.0.0.1:{port}", port=port, auth=False)
             sock.close()
             self.assertIn(b" 403 ", head.split(b"\r\n", 1)[0])

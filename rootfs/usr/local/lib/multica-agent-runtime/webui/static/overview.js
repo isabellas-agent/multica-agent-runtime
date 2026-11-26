@@ -218,6 +218,9 @@
         const open = shell && task.task_dir
           ? `<button class="btn small ghost" data-shell-dir="${escapeHtml(task.workspace_dir)}" data-shell-task="${escapeHtml(task.task_dir)}">Shell</button>`
           : '';
+        const env = UI.config.env && UI.config.env !== 'off'
+          ? `<button class="btn small ghost" data-env-source="pid:${task.pid}" title="Environment of this agent process">Env</button>`
+          : '';
         return `
           <tr>
             <td><span class="agent-cli">${escapeHtml(task.cli)}</span>${task.model ? `<span class="ws-dir">${escapeHtml(task.model)}</span>` : ''}</td>
@@ -226,7 +229,7 @@
             <td class="num">${escapeHtml(humanBytes(task.rss))}</td>
             <td class="num" title="${escapeHtml(task.children.join(', '))}">${task.process_count}</td>
             <td>${escapeHtml(duration(task.running_seconds))}</td>
-            <td class="actions">${open}</td>
+            <td class="actions">${env}${open}</td>
           </tr>`;
       })
       .join('');

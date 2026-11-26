@@ -8,6 +8,9 @@ Serves one page (static/) and a small JSON API:
     GET  /api/system              CPU / memory / network history, filesystems, GPUs, top processes
     GET  /api/workspaces          workspaces and their task directories: size, activity, in-use state
     POST /api/workspaces/delete   {"items":[{"dir":..., "task":..., "confirm":...}], "dry_run":bool}
+    GET  /api/env/sources         environments that can be shown (webui, daemon, agent tasks)
+    GET  /api/env?source=..       variables of one source, secrets masked
+    POST /api/env/reveal          {"source":..., "name":...}: one unmasked value
     GET  /api/terminal            WebSocket: browser terminal (?mode=shell|tmux&dir=..&task=..)
     GET  /api/health              liveness plus effective configuration
 
@@ -37,6 +40,7 @@ from typing import Any
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 
+import env_vars  # noqa: E402
 import system_stats  # noqa: E402
 import terminal  # noqa: E402
 import workspace_store as store  # noqa: E402
@@ -51,6 +55,7 @@ STATIC_FILES = {
     "/overview.js": ("overview.js", "text/javascript; charset=utf-8"),
     "/workspaces.js": ("workspaces.js", "text/javascript; charset=utf-8"),
     "/terminal.js": ("terminal.js", "text/javascript; charset=utf-8"),
+    "/env.js": ("env.js", "text/javascript; charset=utf-8"),
     "/style.css": ("style.css", "text/css; charset=utf-8"),
     "/favicon.svg": ("favicon.svg", "image/svg+xml"),
 }
@@ -220,6 +225,21 @@ class Handler(BaseHTTPRequestHandler):
         if path == "/api/terminal":
             self._terminal(query)
             return
+        if path in ("/api/env", "/api/env/sources"):
+            if env_vars.mode() == "off":
+                self._error(HTTPStatus.FORBIDDEN, "environment view disabled (WEBUI_ENV=0)")
+                return
+            try:
+                if path == "/api/env/sources":
+                    payload = {"sources": env_vars.sources(), "mode": self._env_mode()}
+                else:
+                    payload = env_vars.listing((urllib.parse.parse_qs(query).get("source") or ["webui"])[0])
+                    payload["mode"] = self._env_mode()
+            except env_vars.EnvError as exc:
+                self._error(exc.status, str(exc))
+                return
+            self._json(HTTPStatus.OK, payload)
+            return
         if path in ("/api/system", "/api/agents"):
             try:
                 payload = system_stats.system_payload() if path == "/api/system" else system_stats.agents_payload()
@@ -247,10 +267,13 @@ class Handler(BaseHTTPRequestHandler):
             self._unauthorized()
             return
         path = self.path.split("?", 1)[0]
-        if path != "/api/workspaces/delete":
+        if path not in ("/api/workspaces/delete", "/api/env/reveal"):
             self._error(HTTPStatus.NOT_FOUND, "not found")
             return
-        if self.server.read_only:  # type: ignore[attr-defined]
+        if path == "/api/env/reveal" and self._env_mode() != "full":
+            self._error(HTTPStatus.FORBIDDEN, "revealing values is disabled (WEBUI_ENV / read-only mode)")
+            return
+        if path == "/api/workspaces/delete" and self.server.read_only:  # type: ignore[attr-defined]
             self._error(HTTPStatus.FORBIDDEN, "read-only mode: deletion is disabled")
             return
         # a cross-site form/fetch cannot set this header without a preflight, and the preflight fails
@@ -272,6 +295,16 @@ class Handler(BaseHTTPRequestHandler):
         except (ValueError, OSError):
             self._error(HTTPStatus.BAD_REQUEST, "invalid JSON")
             return
+        if path == "/api/env/reveal":
+            body = payload if isinstance(payload, dict) else {}
+            try:
+                result = env_vars.reveal(str(body.get("source") or "webui"), str(body.get("name") or ""))
+            except env_vars.EnvError as exc:
+                self._error(exc.status, str(exc))
+                return
+            self.log_message("revealed %s of %s", result["name"], body.get("source") or "webui")
+            self._json(HTTPStatus.OK, result)
+            return
         items = payload.get("items") if isinstance(payload, dict) else None
         dry_run = bool(payload.get("dry_run")) if isinstance(payload, dict) else False
         try:
@@ -292,6 +325,12 @@ class Handler(BaseHTTPRequestHandler):
 
     # --- helpers -------------------------------------------------------------------------------
 
+    def _env_mode(self) -> str:
+        current = env_vars.mode()
+        if current == "full" and self.server.read_only:  # type: ignore[attr-defined]
+            return "masked"
+        return current
+
     def _public_config(self) -> dict[str, Any]:
         cfg = store.config()
         return {
@@ -309,6 +348,7 @@ class Handler(BaseHTTPRequestHandler):
             "shell": self.server.shell_enabled(),  # type: ignore[attr-defined]
             "shell_reason": self.server.shell_reason(),  # type: ignore[attr-defined]
             "xterm": bool(node_modules_dir()),
+            "env": self._env_mode(),
             "home": os.environ.get("HOME", ""),
         }
 

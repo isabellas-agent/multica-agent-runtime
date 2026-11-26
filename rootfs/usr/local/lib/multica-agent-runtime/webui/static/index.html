@@ -34,6 +34,10 @@
             <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M3 7.5A1.5 1.5 0 0 1 4.5 6h4l2 2.5h9A1.5 1.5 0 0 1 21 10v8a1.5 1.5 0 0 1-1.5 1.5h-15A1.5 1.5 0 0 1 3 18z" /></svg>
             Workspaces
           </a>
+          <a href="#env" data-view="env" class="tab">
+            <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M8 4H6a2 2 0 0 0-2 2v4l-2 2 2 2v4a2 2 0 0 0 2 2h2M16 4h2a2 2 0 0 1 2 2v4l2 2-2 2v4a2 2 0 0 1-2 2h-2" /></svg>
+            Environment
+          </a>
           <a href="#terminal" data-view="terminal" class="tab">
             <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="m5 8 4 4-4 4M12 17h7" /></svg>
             Terminal <span class="count" id="termCount" hidden>0</span>
@@ -242,6 +246,43 @@
         </p>
       </main>
 
+      <!-- ===== Environment ================================================================== -->
+      <main class="view" id="view-env" hidden>
+        <section class="panel">
+          <div class="toolbar">
+            <select id="envSource" class="select" aria-label="Environment of"></select>
+            <label class="search">
+              <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" aria-hidden="true">
+                <circle cx="11" cy="11" r="7" /><path d="m20 20-3.2-3.2" />
+              </svg>
+              <input id="envSearch" type="search" placeholder="Filter by name or value…" autocomplete="off" spellcheck="false" />
+            </label>
+            <div class="segmented" role="group" aria-label="Filter">
+              <button type="button" data-env-filter="all" class="active">All <span class="count" id="envCountAll">0</span></button>
+              <button type="button" data-env-filter="secret">Secrets <span class="count" id="envCountSecret">0</span></button>
+              <button type="button" data-env-filter="differs" id="envDiffersBtn" hidden>Differs <span class="count" id="envCountDiffers">0</span></button>
+            </div>
+          </div>
+          <div class="table-wrap">
+            <table class="compact env-table">
+              <thead>
+                <tr>
+                  <th>Variable</th>
+                  <th>Value</th>
+                  <th><span class="sr">Actions</span></th>
+                </tr>
+              </thead>
+              <tbody id="envRows"></tbody>
+            </table>
+            <div class="empty small" id="envEmpty" hidden><p id="envEmptyText">No variables.</p></div>
+          </div>
+          <footer class="panel-foot">
+            <span id="envNote">Secrets are masked; revealing one value is logged by the server.</span>
+            <span class="muted" id="envGenerated"></span>
+          </footer>
+        </section>
+      </main>
+
       <!-- ===== Terminal ===================================================================== -->
       <main class="view" id="view-terminal" hidden>
         <section class="panel term-panel">
@@ -301,5 +342,6 @@
     <script src="/overview.js"></script>
     <script src="/workspaces.js"></script>
     <script src="/terminal.js"></script>
+    <script src="/env.js"></script>
   </body>
 </html>

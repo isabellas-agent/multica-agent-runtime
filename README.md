@@ -104,7 +104,7 @@ auth: `TTYD_ARGS="--credential user:password"` (over TLS only).
 
 `webui` serves a management page for the runtime: one page, Python standard library plus xterm.js
 from the image, no build step, no Multica server access (it is deliberately not part of the Multica
-UI). Three views:
+UI). Four views:
 
 - **Overview**: the daemon's status (`/health`: id, version, uptime, running/active tasks, agent CLIs),
   the **running agent tasks** (each agent CLI with its task directory, issue, model, and the CPU and
@@ -114,6 +114,13 @@ UI). Three views:
 - **Workspaces**: the data below `/data/workspaces` per workspace and per **task directory** (size,
   last activity, issue/agent, status **Deletable** / **In use** / **Protected**). Delete single task
   directories, all idle tasks of a workspace, or whole workspaces that are not in use.
+- **Environment**: the environment variables of this container, the Multica daemon and each running
+  agent task (from `/proc/<pid>/environ`: what the agent CLI really got, after the sandbox's env
+  filter; "differs" marks values that are not the same as in the webui container). Secrets — names
+  like `*TOKEN*`, `*KEY*`, `*SECRET*`, `*PASSWORD*`, token-looking values, passwords in URLs — are
+  masked; **Reveal** / **Copy** fetch one value with a separate, CSRF-guarded and logged request.
+  `WEBUI_AUTH*` is never shown. `WEBUI_ENV=masked` (or read-only mode) disables revealing,
+  `WEBUI_ENV=0` the whole view.
 - **Terminal**: browser terminals (xterm.js over a WebSocket to a PTY), several at once as tabs: a
   login shell, the shared tmux session `main` (the same one as `shell`'s `?arg=tmux`), or a shell
   opened directly in a task's directory ("Shell" in the agent and workspace lists).
@@ -392,6 +399,7 @@ Nothing is baked in; the standard variables are read natively:
 | `WEBUI_TRASH`, `WEBUI_KEEP_TRASH_HOURS`, `WEBUI_READ_ONLY`, `WEBUI_RESOLVE_NAMES`, `WEBUI_DAEMON_URL` | `1`, `0`, `off`, `1`, `http://127.0.0.1:$MULTICA_DAEMON_PORT` | web UI: delete through `.webui-trash`, trash retention, disable deletion, resolve names via `multica workspace list`, daemon status source |
 | `WEBUI_CACHE_SECONDS`, `WEBUI_SCAN_BUDGET` | `8`, `120` | web UI: how long a scan is reused, seconds the size scan of one render may take |
 | `WEBUI_BLIND_GRACE`, `WEBUI_ASSUME_SHARED_PID` | `21600`, `0` | web UI: "in use" window when the daemon's processes are not visible (no shared PID namespace), treat the PID namespace as shared anyway |
+| `WEBUI_ENV` | `1` | web UI environment view: `1` masked listing + reveal, `masked` listing only, `0` off |
 | `WEBUI_SHELL`, `WEBUI_SHELL_MAX`, `WEBUI_ALLOWED_ORIGINS` | `1`, `8`, – | web UI terminal: on/off, concurrent sessions, extra allowed `Origin`s (comma separated) behind a proxy that rewrites `Host` |
 | `WEBUI_SAMPLE_SECONDS`, `WEBUI_HISTORY`, `WEBUI_DISKS`, `WEBUI_DOCKER`, `WEBUI_XTERM_DIR` | `2`, `180`, `/data,/home/agent,/nix,/tmp`, `1`, `/usr/local/lib/node_modules` | web UI: resource sampling interval, samples kept, filesystems shown, list Docker containers, where `@xterm/xterm` is installed |
 | `CHROME_EXTRA_ARGS` | – | extra Chrome flags |
