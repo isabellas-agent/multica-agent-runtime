@@ -2,7 +2,8 @@
 # Entrypoint of multica-agent-runtime, started by `tini -g` (signals reach dockerd and the main process).
 #
 #   daemon (default)  Multica daemon in the foreground; Docker per DIND_MODE (default auto); agent
-#                     CLIs per task in bubblewrap per AGENT_SANDBOX (default off, see sandbox.sh)
+#                     CLIs per task in bubblewrap per AGENT_SANDBOX (default off, see sandbox.sh);
+#                     WEBUI_EMBEDDED=1 also runs the management web UI in this container
 #   shell             web terminal (ttyd) on $TTYD_PORT: login shell, `?arg=tmux` for the tmux
 #                     session `main`; uses an existing
 #                     Docker daemon (the daemon container of the same pod), never starts one
@@ -91,10 +92,33 @@ run_daemon() {
     warn "MULTICA_SERVER_URL is not set: the CLI uses its default server"
   fi
   setup_sandbox
+  if [ "${WEBUI_EMBEDDED:-0}" = 1 ]; then
+    start_embedded_webui
+  fi
   multica version || true
   # registers the token and the workspaces it can see in $HOME/.multica
   multica login --token "$MULTICA_TOKEN"
   exec multica daemon start --foreground "$@"
+}
+
+# The web UI next to the daemon: same PID namespace, /nix and cgroup, so in-use detection, Nix GC
+# and the resource numbers cover the agents directly. Restarted when it crashes; a configuration
+# error (exit 2, e.g. no WEBUI_AUTH on a public bind) is not retried.
+start_embedded_webui() {
+  log "management web UI on :${WEBUI_PORT:-8090} (embedded)"
+  (
+    while :; do
+      rc=0
+      python3 "$LIB/webui/server.py" || rc=$?
+      if [ "$rc" = 0 ]; then break; fi
+      if [ "$rc" = 2 ]; then
+        warn "web UI: configuration error, not restarted"
+        break
+      fi
+      warn "web UI exited ($rc), restarting in 5 s"
+      sleep 5
+    done
+  ) &
 }
 
 run_shell() {

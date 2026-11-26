@@ -45,8 +45,11 @@ WEBUI = webui_dir()
 sys.path.insert(0, WEBUI)
 
 ROOT = tempfile.mkdtemp(prefix="webui-test-")
+STATE = tempfile.mkdtemp(prefix="webui-state-")
 os.environ.update(
     {
+        "WEBUI_STATE_DIR": STATE,
+        "WEBUI_USAGE_CACHE_SECONDS": "0",
         "WEBUI_WORKSPACES_ROOT": ROOT,
         "WEBUI_ACTIVITY_GRACE": "300",
         "WEBUI_RESOLVE_NAMES": "0",
@@ -58,7 +61,9 @@ os.environ.update(
     }
 )
 
+import agents_info  # noqa: E402
 import env_vars  # noqa: E402
+import maintenance  # noqa: E402
 import server as webui_server  # noqa: E402
 import system_stats  # noqa: E402
 import workspace_store as store  # noqa: E402
@@ -126,6 +131,7 @@ class WorkspaceStoreTest(unittest.TestCase):
         except subprocess.TimeoutExpired:
             cls.proc.kill()
         shutil.rmtree(ROOT, ignore_errors=True)
+        shutil.rmtree(STATE, ignore_errors=True)
 
     def by_dir(self, snapshot: dict) -> dict[str, dict]:
         return {item["dir"]: item for item in snapshot["workspaces"]}
@@ -315,6 +321,156 @@ class WorkspaceStoreTest(unittest.TestCase):
             shutil.rmtree(outside, ignore_errors=True)
 
 
+    def test_cleanup_workspace_step(self) -> None:
+        old = make_workspace("cleanup-161616161616", task="home-1-0000000000aa")
+        make_workspace("cleanup-161616161616", task="home-2-0000000000bb")
+        age_tree(os.path.join(old, "home-1-0000000000aa"), time.time() - 10 * 86400)
+        age_tree(os.path.join(old, "home-2-0000000000bb"), time.time() - 2 * 86400)
+        busy = make_workspace("cleanup-171717171717", task="home-3-0000000000cc")
+        age_tree(busy, time.time() - 30 * 86400)
+        proc = subprocess.Popen([sys.executable, "-c", "import time; time.sleep(60)"], cwd=os.path.join(busy, "home-3-0000000000cc"))
+        try:
+            time.sleep(0.3)
+            cfg = maintenance.validate({"workspaces": {"enabled": True, "older_than_days": 7, "empty_workspaces": True}})
+            targets = {(item["dir"], item["task"]) for item in maintenance.workspace_candidates(cfg)}
+            self.assertIn(("cleanup-161616161616", "home-1-0000000000aa"), targets)
+            self.assertNotIn(("cleanup-161616161616", "home-2-0000000000bb"), targets)  # only 2 days old
+            self.assertNotIn(("cleanup-171717171717", "home-3-0000000000cc"), targets)  # in use
+            preview = maintenance.step_workspaces(cfg, dry_run=True)
+            self.assertTrue(os.path.isdir(os.path.join(old, "home-1-0000000000aa")))
+            self.assertIn("cleanup-161616161616/home-1-0000000000aa", preview["items"])
+            result = maintenance.step_workspaces(cfg, dry_run=False)
+            self.assertTrue(result["ok"], result)
+            self.assertFalse(os.path.exists(os.path.join(old, "home-1-0000000000aa")))
+            self.assertTrue(os.path.isdir(os.path.join(old, "home-2-0000000000bb")))
+            self.assertTrue(os.path.isdir(os.path.join(busy, "home-3-0000000000cc")))
+        finally:
+            proc.terminate()
+            proc.wait(timeout=10)
+            shutil.rmtree(old, ignore_errors=True)
+            shutil.rmtree(busy, ignore_errors=True)
+
+
+class MaintenanceTest(unittest.TestCase):
+    def setUp(self) -> None:
+        for name in os.listdir(STATE):
+            os.unlink(os.path.join(STATE, name))
+
+    def test_parsers(self) -> None:
+        output = "Deleted Images:\nuntagged: x\n\nTotal reclaimed space: 1.5GB\nTotal reclaimed space: 512kB\n"
+        self.assertEqual(maintenance.docker_reclaimed(output), 1_500_000_000 + 512_000)
+        self.assertEqual(maintenance.docker_reclaimed("Total reclaimed space: 0B"), 0)
+        self.assertEqual(maintenance.nix_freed("deleting ...\n1234 store paths deleted, 2.50 GiB freed\n"), (1234, int(2.5 * 1024**3)))
+        self.assertEqual(maintenance.nix_freed("0 store paths deleted, 0.00 MiB freed"), (0, 0))
+
+    def test_settings_validation_and_persistence(self) -> None:
+        with self.assertRaises(ValueError):
+            maintenance.validate({"schedule": {"time": "25:00"}})
+        cfg = maintenance.validate(
+            {"enabled": True, "schedule": {"mode": "interval", "every_hours": 0}, "docker": {"older_than_hours": -5, "images": "everything"}}
+        )
+        self.assertEqual(cfg["schedule"]["every_hours"], 1)  # clamped
+        self.assertEqual(cfg["docker"]["older_than_hours"], 1)
+        self.assertEqual(cfg["docker"]["images"], "dangling")
+        saved = maintenance.save_settings(cfg)
+        self.assertEqual(maintenance.settings(), saved)
+        self.assertAlmostEqual(maintenance.next_run(saved), time.time() + 3600, delta=5)
+
+    def test_daily_schedule(self) -> None:
+        cfg = maintenance.validate({"enabled": True, "schedule": {"mode": "daily", "time": "04:00"}})
+        maintenance.save_settings(cfg)
+        due = maintenance.next_run(cfg)
+        local = time.localtime(due)
+        self.assertEqual((local.tm_hour, local.tm_min), (4, 0))
+        self.assertTrue(time.time() < due <= time.time() + 86400 + 60)
+        self.assertIsNone(maintenance.next_run(maintenance.validate({"enabled": False})))
+
+    def test_docker_commands_use_age_filter(self) -> None:
+        cfg = maintenance.validate({"docker": {"older_than_hours": 48, "images": "unused", "volumes": True}})
+        commands = maintenance.docker_commands(cfg)
+        joined = [" ".join(command) for command in commands]
+        self.assertIn("docker image prune --force --filter until=48h --all", joined)
+        self.assertIn("docker builder prune --all --force --filter until=48h", joined)
+        self.assertIn("docker volume prune --force", joined)
+        for command in commands:
+            if "volume" not in command:
+                self.assertIn("until=48h", command)
+
+    def test_job_runs_and_records_history(self) -> None:
+        record = maintenance.run(["trash"], dry_run=False, trigger="manual", wait=True)
+        self.assertTrue(record["ok"], record)
+        self.assertIn("trash", record["steps"])
+        self.assertEqual(maintenance.history()[0]["trigger"], "manual")
+        self.assertFalse(maintenance.status()["running"])
+        with self.assertRaises(ValueError):
+            maintenance.run(["bogus"], dry_run=True, trigger="manual")
+
+
+class AgentsInfoTest(unittest.TestCase):
+    def test_claude_usage_from_transcripts(self) -> None:
+        base = tempfile.mkdtemp(prefix="webui-claude-")
+        project = os.path.join(base, "projects", "-data-workspaces-x")
+        os.makedirs(project)
+        now = time.time()
+
+        def line(ts: float, msg: str, req: str, out: int, model: str = "claude-opus-5-5") -> str:
+            stamp = time.strftime("%Y-%m-%dT%H:%M:%S.000Z", time.gmtime(ts))
+            usage = {"input_tokens": 10, "output_tokens": out, "cache_creation_input_tokens": 100, "cache_read_input_tokens": 1000}
+            return json.dumps({"type": "assistant", "timestamp": stamp, "sessionId": "s1", "requestId": req,
+                               "message": {"id": msg, "model": model, "usage": usage}}) + "\n"
+
+        with open(os.path.join(project, "s1.jsonl"), "w", encoding="utf-8") as handle:
+            handle.write(json.dumps({"type": "user", "message": {"content": "hi"}}) + "\n")
+            handle.write(line(now - 20 * 3600, "m0", "r0", 5))  # an earlier block
+            handle.write(line(now - 600, "m1", "r1", 50))
+            handle.write(line(now - 600, "m1", "r1", 50))  # the same response written twice
+            handle.write(line(now - 60, "m2", "r2", 70, model="claude-sonnet-5-5"))
+            handle.write("not json\n")
+        os.environ["WEBUI_CLAUDE_DIRS"] = base
+        try:
+            usage = agents_info.claude_usage()
+            self.assertEqual(usage["windows"]["30d"]["messages"], 3)
+            self.assertEqual(usage["windows"]["30d"]["output"], 125)
+            self.assertEqual(usage["windows"]["30d"]["total"], 3 * 1110 + 125)
+            self.assertIsNotNone(usage["block"])
+            self.assertEqual(usage["block"]["messages"], 2)  # the 20 h old one is another block
+            self.assertEqual({m["model"] for m in usage["models_7d"]}, {"claude-opus-5-5", "claude-sonnet-5-5"})
+            self.assertEqual(len(usage["daily"]), 14)
+        finally:
+            os.environ.pop("WEBUI_CLAUDE_DIRS", None)
+            shutil.rmtree(base, ignore_errors=True)
+
+    def test_login_detection(self) -> None:
+        home = tempfile.mkdtemp(prefix="webui-home-")
+        saved = {name: os.environ.get(name) for name in ("HOME", "CLAUDE_CONFIG_DIR", "OPENAI_API_KEY", "LLM_API_KEY",
+                                                          "CLAUDE_CODE_OAUTH_TOKEN", "ANTHROPIC_API_KEY", "ANTHROPIC_BASE_URL")}
+        try:
+            for name in saved:
+                os.environ.pop(name, None)
+            os.environ["HOME"] = home
+            self.assertFalse(agents_info._login("codex")["logged_in"])
+            os.makedirs(os.path.join(home, ".codex"))
+            with open(os.path.join(home, ".codex", "auth.json"), "w", encoding="utf-8") as handle:
+                handle.write("{}")
+            self.assertTrue(agents_info._login("codex")["logged_in"])
+            os.makedirs(os.path.join(home, ".claude"))
+            with open(os.path.join(home, ".claude", ".credentials.json"), "w", encoding="utf-8") as handle:
+                json.dump({"claudeAiOauth": {"accessToken": "secret", "subscriptionType": "max"}}, handle)
+            login = agents_info.claude_login()
+            self.assertTrue(login["logged_in"])
+            self.assertEqual(login["subscription"], "max")
+            self.assertNotIn("secret", json.dumps(login))
+            names = [item["cli"] for item in agents_info.agents()]
+            self.assertEqual(names, ["claude", "codex", "opencode", "pi", "omp"])
+        finally:
+            for name, value in saved.items():
+                if value is None:
+                    os.environ.pop(name, None)
+                else:
+                    os.environ[name] = value
+            shutil.rmtree(home, ignore_errors=True)
+
+
 class HttpApiTest(unittest.TestCase):
     @classmethod
     def setUpClass(cls) -> None:
@@ -372,6 +528,7 @@ class HttpApiTest(unittest.TestCase):
             ("/overview.js", b"sparkline"),
             ("/terminal.js", b"WebSocket"),
             ("/env.js", b"revealValue"),
+            ("/maintenance.js", b"mntForm"),
             ("/style.css", b"--accent"),
             ("/favicon.svg", b"<svg"),
         )
@@ -514,6 +671,37 @@ class HttpApiTest(unittest.TestCase):
             for name in ("DEMO_API_TOKEN", "DEMO_PLAIN", "WEBUI_AUTH"):
                 os.environ.pop(name, None)
 
+    def test_maintenance_api(self) -> None:
+        auth = self.basic("admin", "s3cret")
+        status, _, body = self.request("GET", "/api/maintenance", headers=auth)
+        self.assertEqual(status, 200, body)
+        payload = json.loads(body)
+        for key in ("settings", "status", "history", "docker", "nix", "next_run"):
+            self.assertIn(key, payload)
+        settings = payload["settings"]
+        settings["enabled"] = True
+        status, _, _ = self.request("POST", "/api/maintenance/settings", {"settings": settings}, auth)
+        self.assertEqual(status, 403)  # no CSRF header
+        headers = {**auth, "X-WebUI": "1"}
+        status, _, body = self.request("POST", "/api/maintenance/settings", {"settings": settings}, headers)
+        self.assertEqual(status, 200, body)
+        self.assertTrue(json.loads(body)["next_run"])
+        status, _, body = self.request("POST", "/api/maintenance/settings", {"settings": {"schedule": {"time": "x"}}}, headers)
+        self.assertEqual(status, 400)
+        status, _, body = self.request("POST", "/api/maintenance/run", {"steps": ["trash"], "dry_run": True}, headers)
+        self.assertEqual(status, 200, body)
+        for _ in range(100):
+            if not maintenance.status().get("running"):
+                break
+            time.sleep(0.1)
+        self.assertTrue(maintenance.history()[0]["dry_run"])
+        maintenance.save_settings({**settings, "enabled": False})
+        status, _, body = self.request("GET", "/api/usage", headers=auth)
+        self.assertEqual(status, 200, body)
+        self.assertIn("windows", json.loads(body))
+        status, _, body = self.request("GET", "/api/agents", headers=auth)
+        self.assertEqual([item["cli"] for item in json.loads(body)["clis"]], ["claude", "codex", "opencode", "pi", "omp"])
+
     def test_agent_cli_detection(self) -> None:
         cases = {
             ("/usr/local/lib/node_modules/@anthropic-ai/claude-code/bin/claude.exe", "-p"): "claude",
@@ -631,6 +819,17 @@ class HttpApiTest(unittest.TestCase):
             response.read()
             connection.close()
             self.assertEqual(response.status, 403)  # read-only: masked listing only
+            connection = http.client.HTTPConnection("127.0.0.1", port, timeout=30)
+            connection.request(
+                "POST",
+                "/api/maintenance/run",
+                body=json.dumps({"steps": ["trash"]}),
+                headers={"Content-Type": "application/json", "X-WebUI": "1"},
+            )
+            response = connection.getresponse()
+            response.read()
+            connection.close()
+            self.assertEqual(response.status, 403)  # read-only: no cleanup
             sock, head = self.ws_connect(origin=f"http://127.0.0.1:{port}", port=port, auth=False)
             sock.close()
             self.assertIn(b" 403 ", head.split(b"\r\n", 1)[0])

@@ -2,7 +2,8 @@
 'use strict';
 
 (() => {
-  const state = { timer: null, system: null, agents: null, loading: false, sparks: new Map() };
+  const state = { timer: null, system: null, agents: null, loading: false, sparks: new Map(), usage: null, usageAt: 0 };
+  const USAGE_MS = 30000;
   const POLL_MS = 3000;
 
   /* --- sparkline: one series, 2px line, soft area, crosshair + tooltip on hover ------------ */
@@ -248,7 +249,105 @@
       : `<li class="muted">${escapeHtml(docker.error || 'Docker CLI or socket not available here.')}</li>`;
   }
 
+  /* --- agent CLIs ------------------------------------------------------------------------- */
+
+  function renderClis(clis) {
+    $('agentClis').innerHTML = (clis || [])
+      .map((a) => {
+        const login = a.login || {};
+        const state = !a.installed ? 'missing' : a.running > 0 ? 'running' : login.logged_in ? 'ready' : 'nologin';
+        const label = { missing: 'not installed', running: `${a.running} running`, ready: 'idle', nologin: 'not logged in' }[state];
+        const reg = a.registered === null || a.registered === undefined ? '' : a.registered ? 'registered with the daemon' : 'not registered with the daemon';
+        const usage = a.running > 0 ? `${a.cpu.toFixed(1)}% CPU · ${humanBytes(a.rss)}` : '';
+        const loginText = login.logged_in
+          ? `${login.method || 'logged in'}${login.subscription ? ` · ${login.subscription}` : ''}`
+          : login.hint || 'not logged in';
+        return `
+          <div class="agent-tile ${state}">
+            <div class="agent-tile-head"><span class="dot"></span><span class="agent-name">${escapeHtml(a.label)}</span><span class="agent-state">${escapeHtml(label)}</span></div>
+            <div class="agent-meta mono">${escapeHtml(a.version || a.cli)}</div>
+            <div class="agent-meta">${escapeHtml(loginText)}</div>
+            <div class="agent-meta faint">${escapeHtml([reg, usage].filter(Boolean).join(' · '))}</div>
+          </div>`;
+      })
+      .join('');
+  }
+
+  /* --- Claude Code usage ------------------------------------------------------------------- */
+
+  function tokens(n) {
+    const v = Number(n) || 0;
+    if (v >= 1e9) return `${(v / 1e9).toFixed(2)}B`;
+    if (v >= 1e6) return `${(v / 1e6).toFixed(v >= 1e7 ? 1 : 2)}M`;
+    if (v >= 1e3) return `${(v / 1e3).toFixed(v >= 1e4 ? 0 : 1)}k`;
+    return String(v);
+  }
+
+  function breakdown(t) {
+    return `in ${tokens(t.input)} · out ${tokens(t.output)} · cache write ${tokens(t.cache_write)} · cache read ${tokens(t.cache_read)}`;
+  }
+
+  function usageTile(label, value, hint, title) {
+    return `<div class="usage-tile" title="${escapeHtml(title || '')}"><span class="label">${escapeHtml(label)}</span><strong>${escapeHtml(value)}</strong><span class="hint">${escapeHtml(hint)}</span></div>`;
+  }
+
+  function renderUsage(u) {
+    const login = u.login || {};
+    $('usageLogin').textContent = login.logged_in
+      ? `logged in · ${login.method}${login.subscription ? ` · ${login.subscription} plan` : ''}`
+      : 'not logged in';
+    const block = u.block;
+    const w = u.windows || {};
+    const now = Date.now() / 1000;
+    const tiles = [
+      block
+        ? usageTile('Current 5-hour block', tokens(block.total), `${block.messages} responses · resets in ${duration(block.end - now)}`, breakdown(block))
+        : usageTile('Current 5-hour block', '–', 'no activity in the last 5 h'),
+      usageTile('Today', tokens(w.today?.total), `${w.today?.messages || 0} responses · out ${tokens(w.today?.output)}`, breakdown(w.today || {})),
+      usageTile('Last 7 days', tokens(w['7d']?.total), `${w['7d']?.sessions || 0} session${w['7d']?.sessions === 1 ? '' : 's'} · out ${tokens(w['7d']?.output)}`, breakdown(w['7d'] || {})),
+      usageTile('Last 30 days', tokens(w['30d']?.total), `${w['30d']?.messages || 0} responses · out ${tokens(w['30d']?.output)}`, breakdown(w['30d'] || {})),
+    ];
+    $('usageTiles').innerHTML = tiles.join('');
+    $('usageModels').textContent = (u.models_7d || []).slice(0, 3).map((m) => `${m.model} ${tokens(m.total)}`).join(' · ');
+
+    const days = u.daily || [];
+    const max = Math.max(1, ...days.map((d) => d.total));
+    $('usageBars').innerHTML = days
+      .map((d, i) => {
+        const h = d.total ? Math.max(3, (d.total / max) * 100) : 0;
+        const date = new Date(d.day * 1000);
+        const label = date.toLocaleDateString(undefined, { weekday: 'short', day: 'numeric' });
+        return `<div class="bar-col" data-bar="${i}"><div class="bar-slot"><div class="bar-fill" style="height:${h.toFixed(1)}%"></div></div><span class="bar-label">${escapeHtml(label)}</span></div>`;
+      })
+      .join('');
+    state.usage = u;
+  }
+
+  $('usageBars').addEventListener('pointermove', (event) => {
+    const col = event.target.closest('[data-bar]');
+    if (!col || !state.usage) return hideTooltip();
+    const d = state.usage.daily[Number(col.dataset.bar)];
+    const date = new Date(d.day * 1000).toLocaleDateString(undefined, { weekday: 'long', month: 'short', day: 'numeric' });
+    showTooltip(
+      `<strong>${escapeHtml(tokens(d.total))} tokens</strong><span>${escapeHtml(date)} · ${d.messages} responses</span><span>${escapeHtml(breakdown(d))}</span>`,
+      event.clientX,
+      event.clientY,
+    );
+  });
+  $('usageBars').addEventListener('pointerleave', hideTooltip);
+
+  async function loadUsage(force) {
+    if (!force && Date.now() - state.usageAt < USAGE_MS) return;
+    state.usageAt = Date.now();
+    try {
+      renderUsage(await api('/api/usage'));
+    } catch (error) {
+      $('usageLogin').textContent = `usage unavailable: ${error.message || error}`;
+    }
+  }
+
   async function load() {
+    loadUsage(false);
     if (state.loading) return;
     state.loading = true;
     try {
@@ -257,6 +356,7 @@
       state.agents = agents;
       renderSystem(system);
       renderAgents(agents);
+      renderClis(agents.clis);
       const count = (agents.terminals || []).length;
       $('termCount').hidden = count === 0;
       $('termCount').textContent = String(count);
@@ -290,6 +390,7 @@
       clearTimeout(state.timer);
     },
     refresh() {
+      loadUsage(true);
       load();
     },
   });

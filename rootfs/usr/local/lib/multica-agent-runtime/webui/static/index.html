@@ -34,6 +34,10 @@
             <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M3 7.5A1.5 1.5 0 0 1 4.5 6h4l2 2.5h9A1.5 1.5 0 0 1 21 10v8a1.5 1.5 0 0 1-1.5 1.5h-15A1.5 1.5 0 0 1 3 18z" /></svg>
             Workspaces
           </a>
+          <a href="#maintenance" data-view="maintenance" class="tab">
+            <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M14.7 6.3a4 4 0 0 0-5.4 5.4L3 18l3 3 6.3-6.3a4 4 0 0 0 5.4-5.4l-2.5 2.5-2.4-.6-.6-2.4z" /></svg>
+            Maintenance <span class="count" id="mntBadge" hidden>●</span>
+          </a>
           <a href="#env" data-view="env" class="tab">
             <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M8 4H6a2 2 0 0 0-2 2v4l-2 2 2 2v4a2 2 0 0 0 2 2h2M16 4h2a2 2 0 0 1 2 2v4l2 2-2 2v4a2 2 0 0 1-2 2h-2" /></svg>
             Environment
@@ -91,6 +95,28 @@
         </section>
 
         <div class="grid">
+          <section class="panel card span-3">
+            <div class="card-head">
+              <h3>Agents</h3>
+              <span class="muted">agent CLIs in this image · login · running tasks</span>
+            </div>
+            <div class="agent-grid" id="agentClis"></div>
+          </section>
+
+          <section class="panel card span-3" id="usageCard">
+            <div class="card-head">
+              <h3>Claude Code usage</h3>
+              <span class="muted" id="usageLogin">–</span>
+            </div>
+            <div class="usage">
+              <div class="usage-tiles" id="usageTiles"></div>
+              <div class="usage-chart">
+                <div class="usage-chart-head"><span>Tokens per day · last 14 days</span><span class="muted" id="usageModels"></span></div>
+                <div class="bars" id="usageBars"></div>
+              </div>
+            </div>
+          </section>
+
           <section class="panel card span-2">
             <div class="card-head">
               <h3>Agent tasks</h3>
@@ -246,6 +272,109 @@
         </p>
       </main>
 
+      <!-- ===== Maintenance ================================================================== -->
+      <main class="view" id="view-maintenance" hidden>
+        <div class="banner info" id="mntRunning" hidden>
+          <span class="spinner" aria-hidden="true"></span><span id="mntRunningText">Cleanup running…</span>
+        </div>
+        <div class="grid">
+          <section class="panel card">
+            <div class="card-head"><h3>Workspaces</h3><span class="muted" id="mntWsHint">old task data</span></div>
+            <dl class="kv" id="mntWs"></dl>
+            <div class="card-actions">
+              <button class="btn small ghost" data-mnt-run="workspaces" data-dry="1">Preview</button>
+              <button class="btn small danger" data-mnt-run="workspaces">Clean up now</button>
+            </div>
+          </section>
+          <section class="panel card">
+            <div class="card-head"><h3>Docker</h3><span class="muted" id="mntDockerHint">nested containers, images, build cache</span></div>
+            <div class="table-wrap"><table class="compact mini"><thead><tr><th>Type</th><th class="num">Size</th><th class="num">Reclaimable</th></tr></thead><tbody id="mntDocker"></tbody></table></div>
+            <div class="card-actions">
+              <button class="btn small ghost" data-mnt-run="docker" data-dry="1">Preview</button>
+              <button class="btn small danger" data-mnt-run="docker">Prune now</button>
+            </div>
+          </section>
+          <section class="panel card">
+            <div class="card-head"><h3>Nix store</h3><span class="muted" id="mntNixHint">/nix</span></div>
+            <dl class="kv" id="mntNix"></dl>
+            <div class="card-actions">
+              <button class="btn small ghost" data-mnt-run="nix" data-dry="1">Preview</button>
+              <button class="btn small danger" data-mnt-run="nix">Collect garbage</button>
+            </div>
+          </section>
+
+          <section class="panel card span-3">
+            <div class="card-head">
+              <h3>Automatic cleanup</h3>
+              <span class="muted" id="mntNext">–</span>
+            </div>
+            <form class="settings" id="mntForm" autocomplete="off">
+              <div class="settings-row">
+                <label class="switch"><input type="checkbox" name="enabled" /><span>Run automatically</span></label>
+                <label class="field">Schedule
+                  <select name="schedule.mode" class="select small-select">
+                    <option value="daily">daily at</option>
+                    <option value="interval">every N hours</option>
+                  </select>
+                </label>
+                <label class="field" data-show="daily">Time <input type="time" name="schedule.time" /></label>
+                <label class="field" data-show="interval">Hours <input type="number" min="1" max="720" name="schedule.every_hours" /></label>
+              </div>
+              <div class="settings-grid">
+                <fieldset>
+                  <legend><label class="switch"><input type="checkbox" name="workspaces.enabled" /><span>Workspace data</span></label></legend>
+                  <label class="field">Delete task directories unused for <input type="number" min="0.5" step="0.5" name="workspaces.older_than_days" /> days</label>
+                  <label class="check"><input type="checkbox" name="workspaces.empty_workspaces" /> also empty workspace directories</label>
+                  <p class="muted small">Never anything in use — the same checks as a manual delete.</p>
+                </fieldset>
+                <fieldset>
+                  <legend><label class="switch"><input type="checkbox" name="docker.enabled" /><span>Docker prune</span></label></legend>
+                  <label class="field">Objects older than <input type="number" min="1" name="docker.older_than_hours" /> hours</label>
+                  <label class="field">Images
+                    <select name="docker.images" class="select small-select">
+                      <option value="dangling">dangling only</option>
+                      <option value="unused">all unused</option>
+                      <option value="none">keep</option>
+                    </select>
+                  </label>
+                  <label class="check"><input type="checkbox" name="docker.containers" /> stopped containers</label>
+                  <label class="check"><input type="checkbox" name="docker.build_cache" /> build cache</label>
+                  <label class="check"><input type="checkbox" name="docker.networks" /> unused networks</label>
+                  <label class="check"><input type="checkbox" name="docker.volumes" /> unused anonymous volumes (no age filter)</label>
+                </fieldset>
+                <fieldset>
+                  <legend><label class="switch"><input type="checkbox" name="nix.enabled" /><span>Nix garbage collection</span></label></legend>
+                  <label class="field">Delete profile generations older than <input type="number" min="0" name="nix.older_than_days" /> days</label>
+                  <p class="muted small">Then everything unreachable in the store is removed (<code>nix-collect-garbage</code>).</p>
+                </fieldset>
+                <fieldset>
+                  <legend><label class="switch"><input type="checkbox" name="trash.enabled" /><span>Empty .webui-trash</span></label></legend>
+                  <p class="muted small" id="mntTrash">–</p>
+                </fieldset>
+              </div>
+              <div class="settings-actions">
+                <span class="muted small" id="mntStateFile"></span>
+                <div class="spacer"></div>
+                <button class="btn small ghost" type="button" data-mnt-run="" data-dry="1">Preview all</button>
+                <button class="btn small ghost" type="button" data-mnt-run="">Run all enabled now</button>
+                <button class="btn small" type="submit" id="mntSave">Save settings</button>
+              </div>
+            </form>
+          </section>
+
+          <section class="panel card span-3">
+            <div class="card-head"><h3>History</h3><span class="muted">last runs</span></div>
+            <div class="table-wrap">
+              <table class="compact">
+                <thead><tr><th>Started</th><th>Trigger</th><th>Steps</th><th class="num">Freed</th><th class="num">Duration</th></tr></thead>
+                <tbody id="mntHistory"></tbody>
+              </table>
+              <div class="empty small" id="mntHistoryEmpty" hidden><p>No cleanup has run yet.</p></div>
+            </div>
+          </section>
+        </div>
+      </main>
+
       <!-- ===== Environment ================================================================== -->
       <main class="view" id="view-env" hidden>
         <section class="panel">
@@ -343,5 +472,6 @@
     <script src="/workspaces.js"></script>
     <script src="/terminal.js"></script>
     <script src="/env.js"></script>
+    <script src="/maintenance.js"></script>
   </body>
 </html>

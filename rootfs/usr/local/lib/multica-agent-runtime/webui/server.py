@@ -8,6 +8,10 @@ Serves one page (static/) and a small JSON API:
     GET  /api/system              CPU / memory / network history, filesystems, GPUs, top processes
     GET  /api/workspaces          workspaces and their task directories: size, activity, in-use state
     POST /api/workspaces/delete   {"items":[{"dir":..., "task":..., "confirm":...}], "dry_run":bool}
+    GET  /api/usage               Claude Code token usage (local transcripts) and login
+    GET  /api/maintenance         cleanup settings, status, history, Docker / Nix usage
+    POST /api/maintenance/run     {"steps":[...], "dry_run":bool}: start a cleanup job
+    POST /api/maintenance/settings {"settings":{...}}: auto cleanup schedule and options
     GET  /api/env/sources         environments that can be shown (webui, daemon, agent tasks)
     GET  /api/env?source=..       variables of one source, secrets masked
     POST /api/env/reveal          {"source":..., "name":...}: one unmasked value
@@ -40,7 +44,9 @@ from typing import Any
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 
+import agents_info  # noqa: E402
 import env_vars  # noqa: E402
+import maintenance  # noqa: E402
 import system_stats  # noqa: E402
 import terminal  # noqa: E402
 import workspace_store as store  # noqa: E402
@@ -56,6 +62,7 @@ STATIC_FILES = {
     "/workspaces.js": ("workspaces.js", "text/javascript; charset=utf-8"),
     "/terminal.js": ("terminal.js", "text/javascript; charset=utf-8"),
     "/env.js": ("env.js", "text/javascript; charset=utf-8"),
+    "/maintenance.js": ("maintenance.js", "text/javascript; charset=utf-8"),
     "/style.css": ("style.css", "text/css; charset=utf-8"),
     "/favicon.svg": ("favicon.svg", "image/svg+xml"),
 }
@@ -225,6 +232,16 @@ class Handler(BaseHTTPRequestHandler):
         if path == "/api/terminal":
             self._terminal(query)
             return
+        if path in ("/api/usage", "/api/maintenance"):
+            try:
+                payload = agents_info.claude_usage() if path == "/api/usage" else maintenance.payload()
+            except Exception as exc:  # noqa: BLE001
+                self._error(HTTPStatus.INTERNAL_SERVER_ERROR, f"collection failed: {exc}")
+                return
+            if path == "/api/maintenance":
+                payload["read_only"] = self.server.read_only  # type: ignore[attr-defined]
+            self._json(HTTPStatus.OK, payload)
+            return
         if path in ("/api/env", "/api/env/sources"):
             if env_vars.mode() == "off":
                 self._error(HTTPStatus.FORBIDDEN, "environment view disabled (WEBUI_ENV=0)")
@@ -248,6 +265,7 @@ class Handler(BaseHTTPRequestHandler):
                 return
             if path == "/api/agents":
                 payload["terminals"] = terminal.sessions_info()
+                payload["clis"] = agents_info.agents()
             self._json(HTTPStatus.OK, payload)
             return
         if path == "/api/workspaces":
@@ -267,14 +285,14 @@ class Handler(BaseHTTPRequestHandler):
             self._unauthorized()
             return
         path = self.path.split("?", 1)[0]
-        if path not in ("/api/workspaces/delete", "/api/env/reveal"):
+        if path not in ("/api/workspaces/delete", "/api/env/reveal", "/api/maintenance/run", "/api/maintenance/settings"):
             self._error(HTTPStatus.NOT_FOUND, "not found")
             return
         if path == "/api/env/reveal" and self._env_mode() != "full":
             self._error(HTTPStatus.FORBIDDEN, "revealing values is disabled (WEBUI_ENV / read-only mode)")
             return
-        if path == "/api/workspaces/delete" and self.server.read_only:  # type: ignore[attr-defined]
-            self._error(HTTPStatus.FORBIDDEN, "read-only mode: deletion is disabled")
+        if path != "/api/env/reveal" and self.server.read_only:  # type: ignore[attr-defined]
+            self._error(HTTPStatus.FORBIDDEN, "read-only mode: deletion and cleanup are disabled")
             return
         # a cross-site form/fetch cannot set this header without a preflight, and the preflight fails
         # for a foreign origin: this is the CSRF guard, Basic credentials alone are not one
@@ -294,6 +312,31 @@ class Handler(BaseHTTPRequestHandler):
             payload = json.loads(raw.decode("utf-8"))
         except (ValueError, OSError):
             self._error(HTTPStatus.BAD_REQUEST, "invalid JSON")
+            return
+        if path in ("/api/maintenance/run", "/api/maintenance/settings"):
+            body = payload if isinstance(payload, dict) else {}
+            try:
+                if path == "/api/maintenance/settings":
+                    result = {"settings": maintenance.save_settings(body.get("settings")), "next_run": None}
+                    result["next_run"] = maintenance.next_run(result["settings"])
+                else:
+                    steps = body.get("steps")
+                    if steps is not None and not isinstance(steps, list):
+                        raise ValueError("steps must be a list")
+                    result = maintenance.run(
+                        [str(step) for step in steps] if steps else None, dry_run=bool(body.get("dry_run")), trigger="manual"
+                    )
+                    self.log_message("cleanup started: %s%s", ",".join(result.get("steps") or []), " (preview)" if body.get("dry_run") else "")
+            except ValueError as exc:
+                self._error(HTTPStatus.BAD_REQUEST, str(exc))
+                return
+            except RuntimeError as exc:
+                self._error(HTTPStatus.CONFLICT, str(exc))
+                return
+            except OSError as exc:
+                self._error(HTTPStatus.INTERNAL_SERVER_ERROR, f"cannot save settings: {exc}")
+                return
+            self._json(HTTPStatus.OK, result)
             return
         if path == "/api/env/reveal":
             body = payload if isinstance(payload, dict) else {}
@@ -469,6 +512,8 @@ def main(argv: list[str] | None = None) -> int:
 
     server = Server((args.bind, args.port), auth, read_only)
     system_stats.sampler()  # start collecting resource history right away
+    if not read_only:
+        maintenance.Scheduler().start()
 
     def stop(signum, _frame):  # noqa: ANN001 - signal handler signature
         sys.stderr.write(f"[webui] signal {signum}, stopping\n")

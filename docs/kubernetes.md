@@ -176,6 +176,10 @@ Expose the shell (port 7681, WebSocket) only behind an authenticating reverse pr
 gateway, oauth2-proxy, ...; see [Web shell](../README.md#web-shell)): ttyd has no login and the shell
 gives access to every token in the pod and to Docker. Restrict it with a NetworkPolicy to the gateway.
 
+Instead of the `webui` container, `WEBUI_EMBEDDED=1` (+ `WEBUI_AUTH` and a `containerPort: 8090`) on
+the `app` container runs the UI next to the daemon: no `shareProcessNamespace` needed, and its Nix
+garbage collection cleans the store the agents actually use (each container has its own `/nix`).
+
 The management UI (`webui`, port 8090) has its own login (`WEBUI_AUTH`), but it deletes data and opens
 shells: expose it through the same proxy and NetworkPolicy, or only via `kubectl port-forward`. Without
 `WEBUI_AUTH` it refuses to listen on `0.0.0.0`. Containers of a pod have separate PID namespaces unless

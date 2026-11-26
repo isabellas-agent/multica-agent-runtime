@@ -104,16 +104,24 @@ auth: `TTYD_ARGS="--credential user:password"` (over TLS only).
 
 `webui` serves a management page for the runtime: one page, Python standard library plus xterm.js
 from the image, no build step, no Multica server access (it is deliberately not part of the Multica
-UI). Four views:
+UI). Five views:
 
-- **Overview**: the daemon's status (`/health`: id, version, uptime, running/active tasks, agent CLIs),
-  the **running agent tasks** (each agent CLI with its task directory, issue, model, and the CPU and
+- **Overview**: the **agents** (Claude Code, Codex, OpenCode, Pi, Oh My Pi: version, login, registered
+  with the daemon, running tasks), **Claude Code usage** (below), the daemon's status (`/health`: id,
+  version, uptime, running/active tasks), the **running agent tasks** (each agent CLI with its task directory, issue, model, and the CPU and
   memory of its whole process tree), resource usage with 6-minute history (node CPU and memory, CPU
   of the runtime's processes, network), filesystems, this container's cgroup limits, GPUs
   (`nvidia-smi`), the nested Docker containers and the top processes.
 - **Workspaces**: the data below `/data/workspaces` per workspace and per **task directory** (size,
   last activity, issue/agent, status **Deletable** / **In use** / **Protected**). Delete single task
   directories, all idle tasks of a workspace, or whole workspaces that are not in use.
+- **Maintenance**: free space — delete task data unused for N days, `docker … prune` (stopped
+  containers, dangling or all unused images, networks, build cache, optionally anonymous volumes,
+  everything with an age filter), Nix garbage collection (`nix-collect-garbage --delete-older-than`),
+  empty `.webui-trash`. Each step can be previewed or run now, and all of them run **automatically**
+  on a schedule (daily at a time, or every N hours) with the options set in the page. Settings and the
+  run history live in `~/.local/state/multica-webui/maintenance.json` (`WEBUI_STATE_DIR`); the
+  `WEBUI_AUTO_CLEANUP*` / `WEBUI_CLEANUP_*` variables only give the defaults of a fresh file.
 - **Environment**: the environment variables of this container, the Multica daemon and each running
   agent task (from `/proc/<pid>/environ`: what the agent CLI really got, after the sandbox's env
   filter; "differs" marks values that are not the same as in the webui container). Secrets — names
@@ -125,9 +133,19 @@ UI). Four views:
   login shell, the shared tmux session `main` (the same one as `shell`'s `?arg=tmux`), or a shell
   opened directly in a task's directory ("Shell" in the agent and workspace lists).
 
-Run it as its own container in the daemon's pod, sharing `/data` and `/home/agent`, and set
-`shareProcessNamespace: true` on the pod so that it sees the daemon's processes (see
-[What "in use" means](#what-in-use-means)):
+**Claude Code usage** is computed from Claude Code's own session transcripts
+(`~/.claude/projects/**/*.jsonl` and the sandbox's `/data/agent-homes/*/.claude`, one usage record per
+API response): tokens of the current 5-hour block (with its reset time), today, 7 and 30 days, per
+day and per model, plus the login (subscription type). Nothing is sent anywhere. The plan's
+percentage limits (`/usage` in Claude Code) are not in those files, so they are not shown.
+
+The simplest setup runs the UI **inside the daemon container**: `WEBUI_EMBEDDED=1` on the `daemon`
+command starts it next to the daemon (restarted if it crashes). It then sees the daemon's processes
+and task locks, the Nix store the agents use, and that container's cgroup — no shared PID namespace
+needed. As its own container in the pod instead, share `/data`, `/home/agent` and `/run/agent`, and
+set `shareProcessNamespace: true` on the pod so that it sees the daemon's processes (see
+[What "in use" means](#what-in-use-means)); its Nix GC then only cleans its own `/nix` (each container
+has its own, the page says so):
 
 ```sh
 docker build --build-arg VARIANT=cpu -t agent-runtime:webui .   # or your own pushed image
@@ -399,6 +417,10 @@ Nothing is baked in; the standard variables are read natively:
 | `WEBUI_TRASH`, `WEBUI_KEEP_TRASH_HOURS`, `WEBUI_READ_ONLY`, `WEBUI_RESOLVE_NAMES`, `WEBUI_DAEMON_URL` | `1`, `0`, `off`, `1`, `http://127.0.0.1:$MULTICA_DAEMON_PORT` | web UI: delete through `.webui-trash`, trash retention, disable deletion, resolve names via `multica workspace list`, daemon status source |
 | `WEBUI_CACHE_SECONDS`, `WEBUI_SCAN_BUDGET` | `8`, `120` | web UI: how long a scan is reused, seconds the size scan of one render may take |
 | `WEBUI_BLIND_GRACE`, `WEBUI_ASSUME_SHARED_PID` | `21600`, `0` | web UI: "in use" window when the daemon's processes are not visible (no shared PID namespace), treat the PID namespace as shared anyway |
+| `WEBUI_EMBEDDED` | `0` | `daemon` command: also run the management web UI in this container |
+| `WEBUI_STATE_DIR`, `WEBUI_AUTO_CLEANUP`, `WEBUI_CLEANUP_AT`, `WEBUI_CLEANUP_EVERY_HOURS` | `~/.local/state/multica-webui`, `0`, `04:00`, `0` | web UI maintenance: settings/history file, defaults of a fresh file: schedule on, daily time, or every N hours instead |
+| `WEBUI_CLEANUP_WORKSPACE_DAYS`, `WEBUI_CLEANUP_DOCKER_HOURS`, `WEBUI_CLEANUP_NIX_DAYS` | `7`, `72`, `14` | defaults: task data unused for N days, Docker objects older than N hours, Nix generations older than N days |
+| `WEBUI_CLAUDE_DIRS` | `$CLAUDE_CONFIG_DIR`, `/data/agent-homes/*/.claude` | Claude Code config dirs whose transcripts count for the usage card |
 | `WEBUI_ENV` | `1` | web UI environment view: `1` masked listing + reveal, `masked` listing only, `0` off |
 | `WEBUI_SHELL`, `WEBUI_SHELL_MAX`, `WEBUI_ALLOWED_ORIGINS` | `1`, `8`, – | web UI terminal: on/off, concurrent sessions, extra allowed `Origin`s (comma separated) behind a proxy that rewrites `Host` |
 | `WEBUI_SAMPLE_SECONDS`, `WEBUI_HISTORY`, `WEBUI_DISKS`, `WEBUI_DOCKER`, `WEBUI_XTERM_DIR` | `2`, `180`, `/data,/home/agent,/nix,/tmp`, `1`, `/usr/local/lib/node_modules` | web UI: resource sampling interval, samples kept, filesystems shown, list Docker containers, where `@xterm/xterm` is installed |
